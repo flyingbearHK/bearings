@@ -25,6 +25,7 @@ export default function App() {
   const [panel, setPanel] = useState('detail') // detail | lookup
   const [lk, setLk] = useState({ data: null, loading: false, error: null, filter: null })
   const [lkLimit, setLkLimit] = useState(100)
+  const [lkRemote, setLkRemote] = useState(false)
   const [results, setResults] = useState(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
@@ -71,6 +72,12 @@ export default function App() {
   const filter = mode === 'name' ? parseFilter(q) : null
   const effMatch = mode === 'value' && match === 'fuzzy' ? 'contains' : match
 
+  const [remoteBusy, setRemoteBusy] = useState(false)
+  const runRemoteValue = async () => {
+    setRemoteBusy(true); setError(null)
+    try { setResults(await api.search(q, 'value', { exact: effMatch === 'exact', schemas: scopeRef.current, remote: true })) }
+    catch (e) { setError(e.message) } finally { setRemoteBusy(false) }
+  }
   const runSearch = useCallback(async (query, m, mt) => {
     const id = ++seq.current
     if (!query.trim()) { setResults(null); setLoading(false); return }
@@ -110,7 +117,7 @@ export default function App() {
       .map((t) => ({ schema: t.schema, table: t.table, columns: t.matched_columns.map((c) => c.column) }))
     setPanel('lookup'); setLk({ data: lk.data, loading: true, error: null, filter: lookupFilter })
     try {
-      const data = await api.lookup(targets, lookupFilter.op, lookupFilter.value, limit)
+      const data = await api.lookup(targets, lookupFilter.op, lookupFilter.value, limit, lkRemote)
       setLk({ data, loading: false, error: null, filter: lookupFilter })
     } catch (e) { setLk({ data: null, loading: false, error: e.message, filter: lookupFilter }) }
   }
@@ -148,7 +155,7 @@ export default function App() {
           ))}
         </nav>
         <span className="spacer" />
-        <ScopePicker schemas={stats?.schema_stats} scope={scope} setScope={setScope} />
+        <ScopePicker schemas={stats?.schema_stats} scope={scope} setScope={setScope} onSynced={() => { loadMeta(); setRefreshKey((k) => k + 1); if (mode === 'name' && q.trim()) runSearch(q, 'name', match) }} />
         {stats?.exists && <span className="muted small stats-line">{stats.tables} tables · {fmt.n(stats.columns)} columns · {stats.profiled} profiled · {stats.relationships} relationships</span>}
         <label className="check" title="Larger text; PII columns masked in samples"><input type="checkbox" checked={workshop} onChange={(e) => setWorkshop(e.target.checked)} /> Workshop mode</label>
         <a className="btn" href={exportUrl('xlsx', scopeParam)} title="Tables, columns, profile, annotations, relationships (current schema scope)">⤓ Excel</a>
@@ -174,8 +181,13 @@ export default function App() {
               ))}
             </div>
             <span className="muted small search-meta">
-              {loading ? (mode === 'value' ? 'Scanning data…' : 'Searching…') : results ? `${results.tables.length} tables${hasCols ? `, ${results.tables.reduce((a, t) => a + t.matched_columns.length, 0)} columns` : ''} · ${results.elapsed_ms} ms` : ''}
+              {loading ? (mode === 'value' ? 'Scanning data…' : 'Searching…') : results ? `${results.tables.length} tables${hasCols ? `, ${results.tables.reduce((a, t) => a + t.matched_columns.length, 0)} columns` : ''} · ${results.elapsed_ms} ms${results.skipped_remote ? ` · ${results.skipped_remote} remote tables not searched (not profiled)` : ''}${results.searched_remote_cached ? ` · ${results.searched_remote_cached} remote via cached key values` : ''}${results.remote_searched ? ` · ${results.remote_searched} remote tables searched live` : ''}${results.remote_errors?.length ? ` · ${results.remote_errors.length} failed` : ''}` : ''}
             </span>
+            {mode === 'value' && results && (results.skipped_remote > 0 || results.searched_remote_cached > 0) && (
+              <button className="btn small" disabled={remoteBusy}
+                title="Scan the remote tables in scope on the SQL warehouse (one query per table – uses warehouse time)"
+                onClick={runRemoteValue}>{remoteBusy ? 'Searching Databricks…' : `⚡ Search ${results.skipped_remote + results.searched_remote_cached} remote tables live`}</button>
+            )}
           </div>
           {filter && (
             <div className="filter-hint">
@@ -188,6 +200,7 @@ export default function App() {
             <main className={`explore ${hasCols ? 'three' : 'two'}`}>
               <TablePane results={list} selected={selKey} mode={mode} browsing={!results}
                 checked={checked} setChecked={setChecked} canLookup={canLookup} onLookup={() => runLookup()} lookupHint={lookupHint}
+                lkRemote={lkRemote} setLkRemote={setLkRemote}
                 onSelect={(r) => openTable(r.schema, r.table, r.matched_columns?.[0]?.column || null)}
                 onProfile={(r) => openTable(r.schema, r.table, null, 'profile')} />
               {hasCols && <ColumnPane results={results.tables} selectedTable={selKey} selectedColumn={selCol} mode={mode}
@@ -199,7 +212,7 @@ export default function App() {
                   onClose={() => setPanel('detail')} onOpenTable={openTable} onOpenSql={(s) => { setSql(s); setView('sql') }} />
               ) : sel ? (
                 <TableDetail schema={sel.schema} table={sel.table} highlight={highlight} focusColumn={selCol} tab={tab} setTab={setTab}
-                  workshop={workshop} allTables={allTables} refreshKey={refreshKey}
+                  workshop={workshop} allTables={allTables} refreshKey={refreshKey} onPulled={loadMeta}
                   onOpenColumn={(c) => { setSelCol(c); setDrawer({ schema: sel.schema, table: sel.table, column: c }) }}
                   onOpenTable={openTable} onOpenSql={(s) => { setSql(s); setView('sql') }} />
               ) : <Hint />}

@@ -63,10 +63,16 @@ export function SqlView({ sql, setSql, tables }) {
   const [err, setErr] = useState(null)
   const [busy, setBusy] = useState(false)
   const [hist, setHist] = useState(() => store.get('sqlHistory', []))
+  const [conns, setConns] = useState([])
+  const [engine, setEngine] = useState(() => store.get('sqlEngine', 'duckdb'))
+  useEffect(() => { api.remote().then((r) => setConns(r.connections || [])).catch(() => {}) }, [])
+  useEffect(() => store.set('sqlEngine', engine), [engine])
+  const remoteEngine = engine.startsWith('databricks:')
+  const shown = tables.filter((t) => (remoteEngine ? t.kind === 'remote' || t.remote : t.kind !== 'remote'))
   const run = async () => {
     setBusy(true); setErr(null)
     try {
-      const r = await api.sql(sql, 1000); setRes(r)
+      const r = await api.sql(sql, 1000, engine); setRes(r)
       const h = [sql, ...hist.filter((x) => x !== sql)].slice(0, 20); setHist(h); store.set('sqlHistory', h)
     } catch (e) { setErr(e.message); setRes(null) } finally { setBusy(false) }
   }
@@ -76,7 +82,7 @@ export function SqlView({ sql, setSql, tables }) {
       <aside className="sql-side">
         <div className="pane-head">Tables</div>
         <ul className="list compact">
-          {tables.map((t) => <li key={`${t.schema}.${t.table}`} className="mono" title="Insert name" onClick={() => setSql(sql + (sql.endsWith(' ') || !sql ? '' : ' ') + `${t.schema}.${t.table}`)}>{t.schema}.{t.table}</li>)}
+          {shown.map((t) => <li key={`${t.schema}.${t.table}`} className="mono" title="Insert name" onClick={() => setSql(sql + (sql.endsWith(' ') || !sql ? '' : ' ') + `${t.schema}.${t.table}`)}>{t.schema}.{t.table}</li>)}
         </ul>
         {hist.length > 0 && <><div className="pane-head">History</div>
           <ul className="list compact">{hist.map((h, i) => <li key={i} className="mono small" title={h} onClick={() => setSql(h)}>{h.replace(/\s+/g, ' ').slice(0, 60)}</li>)}</ul></>}
@@ -86,7 +92,15 @@ export function SqlView({ sql, setSql, tables }) {
           onKeyDown={(e) => { if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); run() } }}
           placeholder="SELECT * FROM pms.reservation LIMIT 100   — Ctrl/⌘+Enter to run. Read-only. Try SUMMARIZE pms.guest" />
         <div className="subbar">
+          {conns.length > 0 && (
+            <select className="engine" value={engine} onChange={(e) => setEngine(e.target.value)}
+              title="Where the query runs. On Databricks, attached aliases (e.g. dev_raw_pms.reservation) are expanded to catalog.schema.table">
+              <option value="duckdb">Local (DuckDB)</option>
+              {conns.map((c) => <option key={c.name} value={`databricks:${c.name}`}>⚡ Databricks · {c.name}</option>)}
+            </select>
+          )}
           <button className="btn primary" onClick={run} disabled={busy || !sql.trim()}>{busy ? 'Running…' : 'Run ⌘↵'}</button>
+          {remoteEngine && <span className="muted small">Databricks SQL, read-only, runs on the SQL warehouse</span>}
           {res && <span className="muted small">{fmt.n(res.rows.length)} rows{res.truncated ? ' (first 1,000)' : ''} · {res.elapsed_ms} ms</span>}
         </div>
         {err && <pre className="error">{err}</pre>}

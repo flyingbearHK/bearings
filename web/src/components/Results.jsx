@@ -1,9 +1,9 @@
 import React from 'react'
-import { fmt } from '../api.js'
+import { STORAGE, fmt } from '../api.js'
 import { Flags } from './Charts.jsx'
 
 /** Layer 1: tables. Layer 2 (only when columns matched): matched columns grouped by table. */
-export function TablePane({ results, selected, onSelect, onProfile, mode, browsing, checked, setChecked, canLookup, onLookup, lookupHint }) {
+export function TablePane({ results, selected, onSelect, onProfile, mode, browsing, checked, setChecked, canLookup, onLookup, lookupHint, lkRemote, setLkRemote }) {
   const keys = results.map((r) => `${r.schema}.${r.table}`)
   const nChecked = keys.filter((k) => checked.has(k)).length
   const all = nChecked > 0 && nChecked === keys.length
@@ -20,6 +20,11 @@ export function TablePane({ results, selected, onSelect, onProfile, mode, browsi
           <button className="btn primary" disabled={!canLookup} onClick={onLookup} title={canLookup ? '' : lookupHint}>
             Show rows · {nChecked} table{nChecked > 1 ? 's' : ''}
           </button>
+          {results.some((r) => keys.includes(`${r.schema}.${r.table}`) && checked.has(`${r.schema}.${r.table}`) && r.storage && r.storage !== 'local') && setLkRemote && (
+            <label className="check" title="Run the lookup on Databricks for the Databricks tables (whole tables, slower). Off: cached tables run locally">
+              <input type="checkbox" checked={!!lkRemote} onChange={(e) => setLkRemote(e.target.checked)} /> ⚡ Remote
+            </label>
+          )}
           <button className="link small" onClick={() => setChecked(new Set())}>clear</button>
           {!canLookup && <div className="muted small">{lookupHint}</div>}
         </div>
@@ -40,8 +45,12 @@ export function TablePane({ results, selected, onSelect, onProfile, mode, browsi
               </div>
               <div className="li-sub">
                 <span className="muted">{r.schema}</span>
-                <span className="muted">{fmt.n(r.row_count)} rows</span>
-                {!r.profiled && <span className="chip warn" title="Run bearings profile">no profile</span>}
+                {r.row_count != null && <span className="muted">{fmt.n(r.row_count)} rows</span>}
+                {STORAGE[r.storage] && <span className={`chip ${STORAGE[r.storage].chip}`} title={`${r.remote?.full_name || ''} – ${STORAGE[r.storage].title}`}>{STORAGE[r.storage].label}</span>}
+                {r.remote?.cache?.outdated && <span className="chip warn" title="The source data changed since it was cached – bearings refresh">⚠ outdated</span>}
+                {r.remote?.cache?.masked?.length > 0 && <span className="chip" title={`PII masked: ${r.remote.cache.masked.join(', ')}`}>🔒</span>}
+                {r.partial && <span className="chip warn" title="Found in the cached sample; the whole table is on Databricks">in sample</span>}
+                {!r.profiled && r.kind !== 'remote' && <span className="chip warn" title="Run bearings profile">no profile</span>}
                 {r.table_matched_by && r.table_matched_by !== 'table' && <span className="chip info">{r.table_matched_by}</span>}
                 {nCols > 0 && <span className="chip accent">{nCols} {mode === 'value' ? 'col' : 'col'}{nCols > 1 ? 's' : ''}{mode === 'value' ? ` · ${fmt.n(r.hits)} hits` : ''}</span>}
               </div>

@@ -159,9 +159,19 @@ The CLI has the same filter: `bearings info -s crm`, `bearings report -s crm -o 
 
 For fully separate engagements or clients, use **separate database files** instead of schemas: `--db data/client-a.duckdb` or `export BEARINGS_DB=data/client-a.duckdb`. Each database gets its own annotations file.
 
-### Resetting the database (start fresh)
+### Removing a schema, or resetting the database
 
-Stop `bearings serve` (Ctrl+C) first, or at least make sure no load is running. Every command asks for confirmation; add `-y` to skip it.
+Stop `bearings serve` (Ctrl+C) first, or run the command in another terminal and refresh the browser afterwards. Every command asks for confirmation; add `-y` to skip it. `uv run bearings info` lists your schemas if you need the exact name.
+
+**Remove one schema.** Which command depends on where the schema came from:
+
+```bash
+uv run bearings drop pms            # a local schema (loaded from CSV/Parquet): its tables, profiles and relationships
+uv run bearings detach dev_raw_pms  # a schema attached from Databricks: cached metadata, profiles, key values and local copies
+uv run bearings compact             # afterwards: shrink the database file
+```
+
+Both keep your annotations (tags, CDM mappings, notes) unless you add `--annotations`. `detach` never touches Databricks – it only forgets what Bearings cached locally; attach the schema again (`bearings connect` or `bearings attach`) and its annotations reappear. `bearings drop <alias>` on a remote schema does the same as `detach`.
 
 | Goal | Command |
 |---|---|
@@ -169,7 +179,9 @@ Stop `bearings serve` (Ctrl+C) first, or at least make sure no load is running. 
 | Wipe everything **including** annotations | `uv run bearings reset --annotations` |
 | Reset one source system only (drop the schema's tables, profile and relationships; compact the file) | `uv run bearings reset -s crm` (add `--annotations` to also remove its annotations) |
 | Remove one table | `uv run bearings drop pms.folio_charge` |
-| Remove one schema | `uv run bearings drop crm` |
+| Remove one local schema | `uv run bearings drop crm` (add `--annotations` to also remove its annotations) |
+| Remove one Databricks schema (cached metadata, profiles, key values, local copies) | `uv run bearings detach dev_raw_pms` (Databricks itself is not touched) |
+| Remove a local copy of a remote table, keep the table attached | `uv run bearings drop dev_raw_pms.reservation` – it goes back to live on Databricks; re-profile it with `uv run bearings profile -t dev_raw_pms.reservation` |
 | Reset the demo | `uv run bearings reset --db data/demo.duckdb --annotations`, or just `uv run bearings demo` again, which rebuilds it |
 | Shrink the file after drops | `uv run bearings compact` (DuckDB doesn't give space back on its own) |
 
@@ -184,7 +196,68 @@ uv run bearings load ./exports/opera --schema pms && uv run bearings profile -s 
 
 The manual way: stop the server and delete the files. `rm data/bearings.duckdb data/bearings.duckdb.wal` wipes the data; also delete `data/bearings.annotations.sqlite` to lose the annotations. `rm -rf demo/ data/demo.*` removes the demo.
 
-### Getting data out of Databricks
+### Remote mode: connect to Azure Databricks (preview)
+
+Instead of exporting files, you can attach a Unity Catalog schema directly. Bearings syncs its **metadata** (tables, columns, types, comments) into the local database, so name search, annotations, CDM mappings and exports work on it straight away, even offline. The **rows stay in Databricks** until you copy a sample with `bearings pull`.
+
+```bash
+uv sync --extra databricks          # once: installs the Databricks SDK + SQL connector
+uv run bearings connect             # guided: workspace URL → browser sign-in → warehouse → catalog → schemas → profile → local copies
+uv run bearings serve
+uv run bearings refresh             # later: re-sync metadata, re-profile what changed, re-find relationships
+```
+
+`bearings connect` asks five questions and does the rest: attach, profile on the warehouse, find relationships, and cache the tables locally. It can also be scripted:
+
+```bash
+uv run bearings connect --host adb-1234567890.12.azuredatabricks.net -c dev_catalog -s raw_pms -s gold_pms --prefix dev_ --profile --cache-max-rows 300000 -y
+```
+
+The individual steps are still available when you want finer control:
+
+```bash
+uv run bearings remote add dev --host https://adb-1234567890.12.azuredatabricks.net
+uv run bearings remote login dev                        # browser sign-in (Entra ID); the token is cached by the Databricks SDK
+uv run bearings remote warehouses dev                   # SQL warehouse ids
+uv run bearings remote add dev --warehouse <id>
+uv run bearings remote test dev --catalog lakehouse           # checks sign-in, Unity Catalog and the SQL warehouse step by step
+uv run bearings attach dev lakehouse.bronze_opera --as opera  # metadata only; default alias is <schema>_dbx
+uv run bearings sync                                         # re-sync every attached schema and show what changed (--dry-run, -s, --catalog)
+uv run bearings profile -s opera                             # profile on the SQL warehouse; stats, flags and key values are cached locally
+uv run bearings relate -s opera                              # relationships between remote tables (and local ones: -s crm -s opera)
+uv run bearings cache -s opera --max-rows 300000             # local cache: tables up to N rows whole, an N-row sample of bigger ones
+uv run bearings cache -s opera --changed                     # re-cache tables whose schema or data changed (refresh does this for you)
+uv run bearings cache -s opera --mask-pii                    # hash personal data in the cache + stored profile (remembered; --no-mask-pii)
+uv run bearings pii -s opera                                 # which columns are masked and why (--keep / --mask to adjust)
+uv run bearings cache -s opera --drop                        # empty the cache: tables run live on Databricks again
+uv run bearings pull opera.reservation --rows 500000         # one table, your own sample size or --where filter
+uv run bearings detach opera                                 # forget the cached metadata and pulled copies (Databricks is never touched)
+```
+
+- **Mixed scope.** Attached schemas appear in the **Schema** dropdown under their connection and catalog (☁), next to your local schemas. Tick any mix of them.
+- **Re-sync.** The ↻ button next to a remote schema (or **sync all** for a catalog) re-reads it from Unity Catalog and lists what changed: tables and columns added or dropped, type and comment changes. The sync uses the Unity Catalog API, so it doesn't need a running SQL warehouse.
+- **Annotations are never lost.** If a column you annotated was renamed or dropped upstream, the sync lists the annotation as *orphaned* with a suggested new column; click it (or run `bearings remap opera.reservation.arrival_dt arrival_date`) to move the tags, CDM mapping and notes. `bearings orphans` lists them at any time.
+- **Profiling remote tables.** `bearings profile -s <alias>` (or ⚡ in the Schema dropdown / on a table) runs on the SQL warehouse: exact row, null and blank counts, min/max and distinct counts over the whole table, and a random sample (200,000 rows by default, `--sample-rows`) for top values, patterns, histograms and PII hints. Remote tables are only profiled when you name them (`-s`, `-t`, or `--remote`), so nothing runs on the warehouse by surprise. After a sync, `--only-stale` re-profiles just the tables that changed.
+- **Key fingerprints.** Profiling also stores the distinct values of key-like columns (ids, codes, unique columns; up to 500,000 per column) in the local database. That's what lets `bearings relate`, the manual overlap check and value search work on remote tables without their rows, including between a remote schema and a local one. Use `--no-fingerprints` if an engagement doesn't allow key values on the laptop.
+- **Local first.** Tables are cached in the local database, so search, samples, profiles, key checks, lookups and SQL run at local speed. Up to 300,000 rows (`--cache-max-rows` / `bearings cache --max-rows N`, remembered per schema; default from `BEARINGS_CACHE_MAX_ROWS`) a table is copied whole; a bigger table gets a random sample of that many rows, and keeps its exact whole-table profile from Databricks. Each table shows where its rows are:
+
+  | Indicator | Meaning | Queries run on |
+  |---|---|---|
+  | **● cached** | complete local copy | the local copy (exact) |
+  | **◐ remote/cached** | a sample is cached (random, or keyed so related samples join), the whole table is on Databricks | the sample – tick **⚡ Remote** for the whole table |
+  | **☁ remote** | not cached | Databricks |
+
+  Results say where they came from ("from the local cache", "from the cached sample (300,000 of 3,220,000 rows)", "⚡ live from Databricks"). A key check that passes on a sample says so, because a duplicate may only exist in the rows that weren't cached.
+- **Samples that join.** When two big tables are related (e.g. `folio.reservation_id → reservation.reservation_id`, found by `bearings relate`), they're sampled on the shared key with the same hash range, so every cached folio row finds its reservation in the cache and orphan checks on cached data stay meaningful (**🔗 sample keyed on …** in the table header). Other big tables get a random sample. Run `relate` before `cache` (`connect` does).
+- **Personal data.** `bearings connect` masks personal data by default (`bearings cache --mask-pii` for an existing schema). Masked are: columns whose values look like e-mail addresses or phone numbers, columns tagged `pii`, and text columns whose name says they hold a personal value (e-mail, phone, passport, birth date, first/last name, street, address line…) and identity numbers (passport, tax id, card number) – not ids, codes, types, flags, templates or dates about them (`EmailAddressID`, `PhoneType`, `EmailConfBody`, `InsertDate` stay readable). Tables that describe organisations rather than people (property, organization, travel agency, room, transaction code…) and business columns (website, HQ, bank, merchant) are left readable. `bearings pii -s <alias>` lists what is masked and why; `bearings pii --keep alias.table.column` keeps a column readable (tag `no-pii`), `--mask` forces one; re-cache to apply (`bearings cache -s <alias> --refresh`). Masked values are salted hashes – `guest@example.com` → `pii_3f9a1c0b7d2e4f61@example.com` – in the cache, the stored profile and the key fingerprints. The hash is the same in every table of the database, so joins, key checks, duplicates and relationships still work, and a lookup of a real value is hashed the same way before matching. ⚡ Remote shows real values (displayed, not stored); workshop mode masks them on screen. Keep disk encryption (FileVault/BitLocker) on regardless.
+- **Fresh data.** Each cached table remembers its Delta version. `bearings refresh` checks the current versions (one small query per cached table), re-profiles and re-caches only the tables whose data changed, and the header says **⚠ source data changed (v12 → v15)** until then.
+- **⚡ Remote on demand.** Tick **⚡ Remote** on a table (sample, key check), next to **Show rows** (lookup), or use **⚡ Search N remote tables live** after a value search, to run that query on the whole table on Databricks. In the SQL tab, the engine picker does the same (*Local* queries the cache, including `dev_raw_pms.reservation`).
+- **Live queries (⚡).** On a remote table, **Sample**, **Check key** and **Show rows** (multi-table lookup, e.g. `reservationid=9401` across local and remote tables) run live on the SQL warehouse. Value search first uses the cached key values; **⚡ Search N remote tables live** scans the remote tables in scope (one query per table). The **SQL** tab has an engine picker: *Local (DuckDB)* or *⚡ Databricks · <connection>*, where aliases such as `dev_raw_pms.reservation` expand to the real `catalog`.`schema`.`table`. Live queries are read-only, capped at 1,000 rows, and time out after 120 s (`BEARINGS_REMOTE_TIMEOUT`); up to 3 warehouse sessions are kept open (`BEARINGS_REMOTE_POOL`), and `cache` / `profile` work on 3 tables at a time over them.
+- **Speed.** A live query goes to the warehouse and back (East US ↔ Hong Kong is a few hundred ms before any work), and a serverless warehouse that has been idle needs ~15–20 s to wake up. So: `serve` wakes the warehouse in the background when remote schemas are attached (`BEARINGS_REMOTE_WARM=0` to turn off) and the table header shows its state; samples use `TABLESAMPLE` instead of sorting the table; a lookup is one query; live value search runs 3 tables at a time; identical lookups / key checks / value searches are reused for 10 minutes (`BEARINGS_REMOTE_CACHE_TTL`). For everything else, the local cache is the answer (**⤓ Cache locally** / **↻ Re-cache** on a table, or `bearings cache`); on workshop days also ask the workspace admin for a 20–30 min auto-stop on the warehouse.
+- **Pull when you need everything locally.** `bearings pull` copies a table (or a sample) into DuckDB: joins with local tables, the local profiler and offline work. A pulled copy replaces the metadata-only entry and keeps a link to its source; if the source changes, its profile is marked stale.
+- **Security.** Connection profiles live in `~/.bearings/connections.toml` and hold no secrets. Every query runs as you through Unity Catalog, so your permissions, row filters and column masks apply. Profiling sends only aggregates and a bounded sample over the wire, and the sample is discarded after profiling. Live query results are shown, not stored. Design notes: `docs/design/remote-databricks.md`.
+
+### Getting data out of Databricks (file export)
 
 ```python
 # Parquet (best: keeps types). Download the folder; each folder becomes one table.
@@ -239,16 +312,18 @@ bearings/
   export.py         xlsx / json / markdown
   demo.py           fictional demo dataset generator
   db.py             connections, _meta schema, reset/drop/compact
+  orphans.py        annotations whose column/table vanished + remap
+  remote/           Databricks: connection profiles, Unity Catalog sync, pull
   api.py            FastAPI (+ serves the built UI)
   static/           built UI
 web/                React + Vite source
-tests/              end-to-end smoke test on demo data
+tests/              end-to-end smoke test on demo data; remote mode against a fake Databricks
 docs/screenshots/   README images (demo data)
 ```
 
 ## Privacy
 
-Bearings is local-first. The server binds to `127.0.0.1`, makes no outbound calls, and everything it stores lives in `data/`, which `.gitignore` excludes together with CSV/Parquet/Excel files. The demo dataset is entirely fictional.
+Bearings is local-first. The server binds to `127.0.0.1` and everything it stores lives in `data/`, which `.gitignore` excludes together with CSV/Parquet/Excel files. It makes no outbound calls unless you set up remote mode, which is opt-in (`uv sync --extra databricks`, then `bearings remote add`) and only talks to the Databricks workspace you configure. The demo dataset is entirely fictional.
 
 ## Contributing
 

@@ -5,7 +5,7 @@ import json
 import re
 from datetime import datetime, timezone
 
-from .db import META, fq, qi
+from .db import META, fq, has_meta_column, qi
 
 NUMERIC = re.compile(r"^(TINYINT|SMALLINT|INTEGER|BIGINT|HUGEINT|UTINYINT|USMALLINT|UINTEGER|UBIGINT|UHUGEINT|FLOAT|DOUBLE|REAL|DECIMAL.*|NUMERIC.*)$", re.I)
 TEMPORAL = re.compile(r"^(DATE|TIMESTAMP.*|TIME.*)$", re.I)
@@ -68,16 +68,33 @@ def profile_table(con, schema: str, table: str, columns: list[str] | None = None
                 exprs += [f"count(*) FILTER (WHERE trim({q}) = '')", f"min(length({q}))", f"avg(length({q}))", f"max(length({q}))",
                           "NULL", "NULL", "NULL", "NULL", "NULL"]
             elif f == "numeric":
+                # statistics in DOUBLE: DECIMAL arithmetic/interpolation can overflow the column's declared precision
+                n = f"CAST({q} AS DOUBLE)"
                 exprs += ["NULL", "NULL", "NULL", "NULL",
-                          f"avg({q})::DOUBLE", f"stddev_samp({q})::DOUBLE",
-                          f"CAST(quantile_cont({q}, 0.25) AS VARCHAR)", f"CAST(quantile_cont({q}, 0.5) AS VARCHAR)", f"CAST(quantile_cont({q}, 0.75) AS VARCHAR)"]
+                          f"avg({n})", f"stddev_samp({n})",
+                          f"CAST(quantile_cont({n}, 0.25) AS VARCHAR)", f"CAST(quantile_cont({n}, 0.5) AS VARCHAR)", f"CAST(quantile_cont({n}, 0.75) AS VARCHAR)"]
             elif f == "temporal":
                 exprs += ["NULL", "NULL", "NULL", "NULL", "NULL", "NULL",
                           f"CAST(quantile_disc({q}, 0.25) AS VARCHAR)", f"CAST(quantile_disc({q}, 0.5) AS VARCHAR)", f"CAST(quantile_disc({q}, 0.75) AS VARCHAR)"]
             else:
                 exprs += ["NULL"] * 9
-        row = con.execute(f"SELECT {', '.join(exprs)} FROM {src}").fetchone()
         k = 13
+        failed: dict[str, str] = {}
+        try:
+            row = con.execute(f"SELECT {', '.join(exprs)} FROM {src}").fetchone()
+        except Exception:
+            # one odd column shouldn't lose the whole table: retry column by column
+            row = []
+            for i, (c, t) in enumerate(chunk):
+                try:
+                    row += list(con.execute(f"SELECT {', '.join(exprs[i * k:(i + 1) * k])} FROM {src}").fetchone())
+                except Exception as e:
+                    failed[c] = str(e).splitlines()[0]
+                    try:
+                        nn_only = con.execute(f"SELECT count({qi(c)}) FROM {src}").fetchone()[0]
+                    except Exception:
+                        nn_only = None
+                    row += [nn_only, 0] + [None] * (k - 2)
         for i, (c, t) in enumerate(chunk):
             r = row[i * k:(i + 1) * k]
             nn, dist = r[0] or 0, r[1] or 0
@@ -91,6 +108,7 @@ def profile_table(con, schema: str, table: str, columns: list[str] | None = None
                 "min_val": _trim(r[2]), "max_val": _trim(r[3]),
                 "min_len": r[5], "avg_len": round(r[6], 2) if r[6] is not None else None, "max_len": r[7],
                 "mean": r[8], "stddev": r[9], "p25": r[10], "p50": r[11], "p75": r[12],
+                "errors": [failed[c]] if c in failed else [],
             })
 
     for p in results:
@@ -100,70 +118,53 @@ def profile_table(con, schema: str, table: str, columns: list[str] | None = None
         nn = p["row_count"] - p["null_count"]
         unique = nn > 0 and p["distinct_count"] >= nn and not approx
         # top values (skip for fully unique columns: every value would have count 1)
-        top = []
-        if nn and not unique:
-            top = [{"v": _trim(x[0]), "n": x[1]} for x in con.execute(
-                f"SELECT CAST({v} AS VARCHAR), count(*) FROM {src} WHERE {q} IS NOT NULL GROUP BY 1 ORDER BY 2 DESC, 1 LIMIT {int(top_n)}").fetchall()]
-        # character-shape patterns for strings
-        patterns = []
+        top, patterns, hist = [], [], []
         email_share = phone_share = 0.0
-        if f == "string" and nn:
-            patterns = [{"p": x[0], "n": x[1]} for x in con.execute(
-                f"""SELECT regexp_replace(regexp_replace(regexp_replace(left({q}, 40), '[A-Z]', 'A', 'g'), '[a-z]', 'a', 'g'), '[0-9]', '9', 'g') AS p,
-                           count(*) FROM {src} WHERE {q} IS NOT NULL GROUP BY 1 ORDER BY 2 DESC LIMIT 8""").fetchall()]
-            em, ph = con.execute(
-                f"""SELECT avg(CASE WHEN regexp_matches({q}, '{EMAIL_RE}') THEN 1 ELSE 0 END),
-                           avg(CASE WHEN regexp_matches({q}, '{PHONE_RE}') THEN 1 ELSE 0 END)
-                    FROM (SELECT {q} FROM {src} WHERE {q} IS NOT NULL LIMIT 2000)""").fetchone()
-            email_share, phone_share = em or 0, ph or 0
-        # histogram for numeric / temporal
-        hist = []
-        if f in ("numeric", "temporal") and p["distinct_count"] > 1:
-            x = f"epoch({q})" if f == "temporal" else f"CAST({q} AS DOUBLE)"
-            lo, hi = con.execute(f"SELECT min({x}), max({x}) FROM {src}").fetchone()
-            if lo is not None and hi is not None and hi > lo:
-                bins = 20
-                rows = con.execute(
-                    f"""SELECT least(floor(({x} - {lo}) / ({hi} - {lo}) * {bins}), {bins - 1})::INT b, count(*)
-                        FROM {src} WHERE {q} IS NOT NULL GROUP BY 1 ORDER BY 1""").fetchall()
-                counts = dict(rows)
-                w = (hi - lo) / bins
-                for b in range(bins):
-                    a, z = lo + b * w, lo + (b + 1) * w
-                    if f == "temporal":
-                        a, z = _fmt_epoch(a, t), _fmt_epoch(z, t)
-                    else:
-                        a, z = round(a, 4), round(z, 4)
-                    hist.append({"lo": a, "hi": z, "n": counts.get(b, 0)})
-        flags = []
-        if nn == 0:
-            flags.append("all_null")
-        elif p["distinct_count"] == 1:
-            flags.append("constant")
-        keyish = f == "string" or (f == "numeric" and not re.match(r"^(FLOAT|DOUBLE|REAL)", t, re.I))
-        if unique and p["null_count"] == 0 and keyish:
-            flags.append("candidate_pk")
-        elif unique and p["null_count"] == 0:
-            flags.append("unique")
-        elif unique:
-            flags.append("unique_with_nulls")
-        if nn > 0 and p["null_pct"] >= 50:
-            flags.append("high_null")
-        if email_share > 0.8:
-            flags.append("pii_email")
-        if phone_share > 0.8 and PII_NAME.search(c):
-            flags.append("pii_phone")
-        if PII_NAME.search(c) and not any(fl.startswith("pii_") for fl in flags):
-            flags.append("pii_name_hint")
-        if len(patterns) > 1 and nn and p["distinct_count"] > 1:
-            shapes: dict = {}
-            for pt in patterns:  # compare shapes ignoring run length: 'Aaaaa' ~ 'Aaa'
-                k = re.sub(r"(A)A+|(a)a+|(9)9+", lambda m: m.group(1) or m.group(2) or m.group(3), pt["p"])
-                shapes[k] = shapes.get(k, 0) + pt["n"]
-            if max(shapes.values()) / nn < 0.8:
-                flags.append("mixed_format")
-        if (p["blank_count"] or 0) > 0:
-            flags.append("has_blanks")
+        errors = p.pop("errors", [])
+        try:
+            if nn and not unique:
+                top = [{"v": _trim(x[0]), "n": x[1]} for x in con.execute(
+                    f"SELECT CAST({v} AS VARCHAR), count(*) FROM {src} WHERE {q} IS NOT NULL GROUP BY 1 ORDER BY 2 DESC, 1 LIMIT {int(top_n)}").fetchall()]
+        except Exception as e:
+            errors.append(f"top values: {str(e).splitlines()[0]}")
+        # character-shape patterns for strings
+        try:
+            if f == "string" and nn:
+                patterns = [{"p": x[0], "n": x[1]} for x in con.execute(
+                    f"""SELECT regexp_replace(regexp_replace(regexp_replace(left({q}, 40), '[A-Z]', 'A', 'g'), '[a-z]', 'a', 'g'), '[0-9]', '9', 'g') AS p,
+                               count(*) FROM {src} WHERE {q} IS NOT NULL GROUP BY 1 ORDER BY 2 DESC LIMIT 8""").fetchall()]
+                em, ph = con.execute(
+                    f"""SELECT avg(CASE WHEN regexp_matches({q}, '{EMAIL_RE}') THEN 1 ELSE 0 END),
+                               avg(CASE WHEN regexp_matches({q}, '{PHONE_RE}') THEN 1 ELSE 0 END)
+                        FROM (SELECT {q} FROM {src} WHERE {q} IS NOT NULL LIMIT 2000)""").fetchone()
+                email_share, phone_share = em or 0, ph or 0
+        except Exception as e:
+            errors.append(f"patterns: {str(e).splitlines()[0]}")
+        # histogram for numeric / temporal (bounds passed as DOUBLE parameters, never as DECIMAL literals)
+        try:
+            if f in ("numeric", "temporal") and p["distinct_count"] > 1:
+                x = f"epoch({q})" if f == "temporal" else f"CAST({q} AS DOUBLE)"
+                lo, hi = con.execute(f"SELECT min({x})::DOUBLE, max({x})::DOUBLE FROM {src}").fetchone()
+                if lo is not None and hi is not None and hi > lo:
+                    bins = 20
+                    rows = con.execute(
+                        f"""SELECT least(floor(({x} - $lo) / ($hi - $lo) * {bins}), {bins - 1})::INT b, count(*)
+                            FROM {src} WHERE {q} IS NOT NULL GROUP BY 1 ORDER BY 1""", {"lo": float(lo), "hi": float(hi)}).fetchall()
+                    counts = dict(rows)
+                    w = (hi - lo) / bins
+                    for b in range(bins):
+                        a, z = lo + b * w, lo + (b + 1) * w
+                        if f == "temporal":
+                            a, z = _fmt_epoch(a, t), _fmt_epoch(z, t)
+                        else:
+                            a, z = round(a, 4), round(z, 4)
+                        hist.append({"lo": a, "hi": z, "n": counts.get(b, 0)})
+        except Exception as e:
+            errors.append(f"histogram: {str(e).splitlines()[0]}")
+            hist = []
+        p["errors"] = errors
+        p.update(email_share=email_share, phone_share=phone_share, approx=approx, pattern_base=nn)
+        flags = compute_flags(p, patterns)
         p.update(top_values=top, patterns=patterns, histogram=hist, flags=flags)
 
     tprof = {
@@ -171,8 +172,49 @@ def profile_table(con, schema: str, table: str, columns: list[str] | None = None
         "column_count": len(_columns(con, fq(schema, table))),
         "candidate_keys": [p["column_name"] for p in results if "candidate_pk" in p["flags"]],
         "sampled_rows": sampled,
+        "errors": [f"{p['column_name']}: {e}" for p in results for e in p.get("errors", [])],
     }
     return tprof, results
+
+
+def compute_flags(p: dict, patterns: list[dict]) -> list[str]:
+    """Profile flags from a column profile dict (also used after remote exact stats replace sample stats)."""
+    c, t = p["column_name"], p["data_type"]
+    f = family(t)
+    nn = (p["row_count"] or 0) - (p["null_count"] or 0)
+    unique = nn > 0 and (p["distinct_count"] or 0) >= nn and not p.get("approx")
+    flags = []
+    if nn == 0:
+        flags.append("all_null")
+    elif p["distinct_count"] == 1:
+        flags.append("constant")
+    keyish = f == "string" or (f == "numeric" and not re.match(r"^(FLOAT|DOUBLE|REAL)", t, re.I))
+    if unique and p["null_count"] == 0 and keyish:
+        flags.append("candidate_pk")
+    elif unique and p["null_count"] == 0:
+        flags.append("unique")
+    elif unique:
+        flags.append("unique_with_nulls")
+    if nn > 0 and p["null_pct"] >= 50:
+        flags.append("high_null")
+    if (p.get("email_share") or 0) > 0.8:
+        flags.append("pii_email")
+    if (p.get("phone_share") or 0) > 0.8 and PII_NAME.search(c):
+        flags.append("pii_phone")
+    if PII_NAME.search(c) and not any(fl.startswith("pii_") for fl in flags):
+        flags.append("pii_name_hint")
+    if len(patterns) > 1 and nn and p["distinct_count"] > 1:
+        shapes: dict = {}
+        for pt in patterns:  # compare shapes ignoring run length: 'Aaaaa' ~ 'Aaa'
+            k = re.sub(r"(A)A+|(a)a+|(9)9+", lambda m: m.group(1) or m.group(2) or m.group(3), pt["p"])
+            shapes[k] = shapes.get(k, 0) + pt["n"]
+        if max(shapes.values()) / (p.get("pattern_base") or nn) < 0.8:
+            flags.append("mixed_format")
+    if (p["blank_count"] or 0) > 0:
+        flags.append("has_blanks")
+    if p.get("errors"):
+        flags.append("profile_error")
+    return flags
 
 
 def _trim(v, n=200):
@@ -199,7 +241,8 @@ def save(con, tprof: dict, cols: list[dict]):
     now = datetime.now()
     s, t = tprof["schema_name"], tprof["table_name"]
     con.execute(f"DELETE FROM {META}.table_profile WHERE schema_name=? AND table_name=?", [s, t])
-    con.execute(f"INSERT INTO {META}.table_profile VALUES (?,?,?,?,?,?,?)",
+    con.execute(f"INSERT INTO {META}.table_profile (schema_name, table_name, row_count, column_count, candidate_keys, sampled_rows, profiled_at) "
+                "VALUES (?,?,?,?,?,?,?)",
                 [s, t, tprof["row_count"], tprof["column_count"], json.dumps(tprof["candidate_keys"]), tprof["sampled_rows"], now])
     con.execute(f"DELETE FROM {META}.column_profile WHERE schema_name=? AND table_name=?", [s, t])
     rows = []
@@ -213,12 +256,13 @@ def save(con, tprof: dict, cols: list[dict]):
 
 def load_profile(con, schema: str, table: str):
     """Stored profile for a table → (table dict | None, {column_name: dict})."""
-    t = con.execute(f"SELECT row_count, column_count, candidate_keys, sampled_rows, profiled_at FROM {META}.table_profile WHERE schema_name=? AND table_name=?",
+    stale = ", stale" if has_meta_column(con, "table_profile", "stale") else ", false"
+    t = con.execute(f"SELECT row_count, column_count, candidate_keys, sampled_rows, profiled_at{stale} FROM {META}.table_profile WHERE schema_name=? AND table_name=?",
                     [schema, table]).fetchone()
     tp = None
     if t:
         tp = {"row_count": t[0], "column_count": t[1], "candidate_keys": json.loads(t[2] or "[]"),
-              "sampled_rows": t[3], "profiled_at": str(t[4])}
+              "sampled_rows": t[3], "profiled_at": str(t[4]), "stale": bool(t[5])}
     cur = con.execute(f"SELECT {', '.join(COLS)} FROM {META}.column_profile WHERE schema_name=? AND table_name=? ORDER BY ordinal", [schema, table])
     cols = {}
     for r in cur.fetchall():

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bearings"
-version = "0.1.0"
+version = "0.2.0"
 description = "Get your bearings in unfamiliar source data: a local data-modelling workbench (DuckDB + web UI) for searching, profiling, sampling and relating CSV/Parquet exports."
 readme = "README.md"
 license = { text = "MIT" }
@@ -25,6 +25,18 @@ dependencies = [
   "typer>=0.12",
   "rapidfuzz>=3.6",
   "openpyxl>=3.1",
+  "pytz>=2024.1",    # DuckDB needs it to return TIMESTAMP WITH TIME ZONE values (e.g. tables pulled from Databricks)
+]
+
+[project.optional-dependencies]
+# Remote mode: connect to Azure Databricks (Unity Catalog metadata sync, remote profiling,
+# pass-through queries). Install with:  uv sync --extra databricks
+databricks = [
+  "databricks-sdk>=0.40",            # browser OAuth (Entra ID), Unity Catalog REST API
+  "databricks-sql-connector>=3.4",   # SQL warehouse queries, Arrow results
+  "pyarrow>=14",                     # Arrow -> DuckDB for `bearings pull`
+  "sqlglot>=25",                     # DuckDB -> Databricks SQL dialect translation
+  "tomli>=2; python_version < '3.11'",  # reading ~/.bearings/connections.toml on Python 3.10
 ]
 
 [project.urls]
@@ -49,3 +61,8 @@ bearings = ["static/**/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+filterwarnings = [
+  # noise from FastAPI's TestClient on newer Starlette / anyio – not from Bearings
+  "ignore:Using `httpx` with `starlette.testclient` is deprecated",
+  "ignore:The anyio.abc.BlockingPortal alias is deprecated",
+]

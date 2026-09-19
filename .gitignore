@@ -20,3 +20,8 @@ __pycache__/
 .pytest_cache/
 web/node_modules/
 .DS_Store
+
+# --- databricks auth / local connection profiles never go to git ---
+.databrickscfg
+.databricks/
+.bearings/

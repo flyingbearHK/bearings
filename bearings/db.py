@@ -41,6 +41,46 @@ CREATE TABLE IF NOT EXISTS {META}.relationships (
   name_score DOUBLE, overlap_pct DOUBLE, from_distinct BIGINT, matched_distinct BIGINT,
   confidence DOUBLE, method VARCHAR, found_at TIMESTAMP
 );
+-- remote sources (Azure Databricks / Unity Catalog): metadata cached here, data stays remote
+CREATE TABLE IF NOT EXISTS {META}.remote_sources (
+  alias VARCHAR PRIMARY KEY, connection VARCHAR, catalog VARCHAR, schema VARCHAR,
+  attached_at TIMESTAMP, synced_at TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS {META}.remote_tables (
+  alias VARCHAR, table_name VARCHAR, table_type VARCHAR, comment VARCHAR,
+  row_count BIGINT, size_bytes BIGINT, remote_updated_at TIMESTAMP, synced_at TIMESTAMP,
+  dropped BOOLEAN DEFAULT false
+);
+CREATE TABLE IF NOT EXISTS {META}.remote_columns (
+  alias VARCHAR, table_name VARCHAR, column_name VARCHAR, ordinal INTEGER,
+  data_type VARCHAR, nullable BOOLEAN, comment VARCHAR
+);
+CREATE TABLE IF NOT EXISTS {META}.sync_log (
+  alias VARCHAR, synced_at TIMESTAMP, change VARCHAR, table_name VARCHAR, column_name VARCHAR,
+  old_value VARCHAR, new_value VARCHAR
+);
+ALTER TABLE {META}.table_profile ADD COLUMN IF NOT EXISTS stale BOOLEAN DEFAULT false;
+-- key fingerprints: distinct values of key-like columns of remote tables, so relationship discovery and
+-- value search can run locally without the rows (complete = every distinct value is stored)
+CREATE TABLE IF NOT EXISTS {META}.key_fingerprint (
+  schema_name VARCHAR, table_name VARCHAR, column_name VARCHAR, distinct_count BIGINT, stored BIGINT,
+  complete BOOLEAN, captured_at TIMESTAMP
+);
+-- local cache of remote tables: complete copy, or a random sample of bigger tables
+CREATE TABLE IF NOT EXISTS {META}.remote_cache (
+  alias VARCHAR, table_name VARCHAR, cached_rows BIGINT, total_rows BIGINT, complete BOOLEAN, cached_at TIMESTAMP
+);
+ALTER TABLE {META}.remote_sources ADD COLUMN IF NOT EXISTS cache_max_rows BIGINT;
+ALTER TABLE {META}.remote_sources ADD COLUMN IF NOT EXISTS mask_pii BOOLEAN;
+ALTER TABLE {META}.remote_cache ADD COLUMN IF NOT EXISTS sample_method VARCHAR;
+ALTER TABLE {META}.remote_cache ADD COLUMN IF NOT EXISTS masked_columns VARCHAR;
+ALTER TABLE {META}.remote_cache ADD COLUMN IF NOT EXISTS source_version BIGINT;
+ALTER TABLE {META}.remote_cache ADD COLUMN IF NOT EXISTS latest_version BIGINT;
+ALTER TABLE {META}.remote_cache ADD COLUMN IF NOT EXISTS checked_at TIMESTAMP;
+CREATE TABLE IF NOT EXISTS {META}.settings (key VARCHAR PRIMARY KEY, value VARCHAR);
+CREATE TABLE IF NOT EXISTS {META}.key_values (
+  schema_name VARCHAR, table_name VARCHAR, column_name VARCHAR, v VARCHAR
+);
 """
 
 
@@ -71,7 +111,7 @@ def connect(db_path: Path, read_only: bool = False, retries: int = 0) -> duckdb.
             if not read_only:
                 con.execute(META_DDL)
             return con
-        except duckdb.IOException as e:  # lock held by another process
+        except (duckdb.IOException, duckdb.ConnectionException) as e:  # lock held by another process / connection
             last = e
             time.sleep(0.4 * (attempt + 1))
     raise DatabaseBusy(str(last))
@@ -84,7 +124,7 @@ class DatabaseBusy(RuntimeError):
 @contextmanager
 def ro(db_path: Path):
     """Short-lived read-only connection (lets `bearings load/profile` run while the server is up)."""
-    con = connect(db_path, read_only=True, retries=3)
+    con = connect(db_path, read_only=True, retries=5)
     try:
         yield con
     finally:
@@ -109,7 +149,27 @@ def safe_name(name: str) -> str:
     return n
 
 
+def has_meta(con, name: str) -> bool:
+    """True if _meta.<name> exists (a read-only connection to an older database won't have the newer tables)."""
+    return bool(con.execute("SELECT count(*) FROM duckdb_tables() WHERE schema_name=? AND table_name=? AND database_name=current_database()",
+                            [META, name]).fetchone()[0])
+
+
+def has_meta_column(con, table: str, column: str) -> bool:
+    return bool(con.execute("SELECT count(*) FROM duckdb_columns() WHERE schema_name=? AND table_name=? AND column_name=? "
+                            "AND database_name=current_database()", [META, table, column]).fetchone()[0])
+
+
+def remote_aliases(con) -> dict[str, dict]:
+    """alias -> {connection, catalog, schema, attached_at, synced_at} for attached remote schemas."""
+    if not has_meta(con, "remote_sources"):
+        return {}
+    cur = con.execute(f"SELECT alias, connection, catalog, schema, attached_at, synced_at FROM {META}.remote_sources ORDER BY alias")
+    return {r[0]: dict(zip(["alias", "connection", "catalog", "schema", "attached_at", "synced_at"], r)) for r in cur.fetchall()}
+
+
 def user_tables(con) -> list[tuple[str, str]]:
+    """Local DuckDB tables only (remote tables have no data here)."""
     return con.execute(
         """SELECT table_schema, table_name FROM information_schema.tables
            WHERE table_schema NOT IN ('_meta','information_schema','pg_catalog')
@@ -142,11 +202,21 @@ def ann_connect(db_path: Path) -> sqlite3.Connection:
 # ---------- clean-up ----------
 
 def drop_table(con, schema: str, table: str) -> None:
+    if has_meta(con, "remote_tables") and con.execute(
+            f"SELECT count(*) FROM {META}.remote_tables WHERE alias=? AND table_name=? AND NOT dropped", [schema, table]).fetchone()[0]:
+        # the local cache of a remote table: drop the rows, keep what describes the remote table (profile, keys, relationships)
+        con.execute(f"DROP TABLE IF EXISTS {fq(schema, table)}")
+        for m in ("load_log", "comments"):
+            con.execute(f"DELETE FROM {META}.{m} WHERE schema_name=? AND table_name=?", [schema, table])
+        con.execute(f"DELETE FROM {META}.remote_cache WHERE alias=? AND table_name=?", [schema, table])
+        return
     con.execute(f"DROP TABLE IF EXISTS {fq(schema, table)}")
-    for m in ("load_log", "comments", "table_profile", "column_profile"):
+    for m in ("load_log", "comments", "table_profile", "column_profile") + (("key_fingerprint", "key_values") if has_meta(con, "key_values") else ()):
         con.execute(f"DELETE FROM {META}.{m} WHERE schema_name=? AND table_name=?", [schema, table])
     con.execute(f"DELETE FROM {META}.relationships WHERE (from_schema=? AND from_table=?) OR (to_schema=? AND to_table=?)",
                 [schema, table, schema, table])
+    if has_meta(con, "remote_cache"):
+        con.execute(f"DELETE FROM {META}.remote_cache WHERE alias=? AND table_name=?", [schema, table])
 
 
 def drop_schema(con, schema: str) -> int:
@@ -156,9 +226,12 @@ def drop_schema(con, schema: str) -> int:
             con.execute(f"DROP TABLE IF EXISTS {fq('main', t)}")
     else:
         con.execute(f"DROP SCHEMA IF EXISTS {qi(schema)} CASCADE")
-    for m in ("load_log", "comments", "table_profile", "column_profile"):
+    for m in ("load_log", "comments", "table_profile", "column_profile") + (("key_fingerprint", "key_values") if has_meta(con, "key_values") else ()):
         con.execute(f"DELETE FROM {META}.{m} WHERE schema_name=?", [schema])
     con.execute(f"DELETE FROM {META}.relationships WHERE from_schema=? OR to_schema=?", [schema, schema])
+    if schema in remote_aliases(con):  # an attached Databricks schema: forget its cached metadata too
+        for t in ("remote_tables", "remote_columns", "sync_log", "remote_sources") + (("remote_cache",) if has_meta(con, "remote_cache") else ()):
+            con.execute(f"DELETE FROM {META}.{t} WHERE alias=?", [schema])
     return n
 
 

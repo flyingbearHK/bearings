@@ -5,8 +5,10 @@ import datetime as dt
 import decimal
 import os
 import re
+import threading
 import time
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import Body, FastAPI, HTTPException, Request
@@ -14,17 +16,37 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Res
 from fastapi.staticfiles import StaticFiles
 
 from . import catalog, export, profiler, relationships
-from .db import META, DatabaseBusy, ann_connect, default_db_path, fq, qi, ro
+from .db import META, DatabaseBusy, ann_connect, default_db_path, fq, qi, remote_aliases, ro
 
 DB = default_db_path()
 STATIC = Path(__file__).parent / "static"
 
-app = FastAPI(title="Bearings", version="0.1.0")
+@asynccontextmanager
+async def _lifespan(_app):
+    _warm_on_start()  # wake the Databricks warehouse(s) in the background, if remote schemas are attached
+    yield
+
+
+app = FastAPI(title="Bearings", version="0.1.0", lifespan=_lifespan)
 
 
 @app.exception_handler(DatabaseBusy)
 async def busy(_: Request, e: DatabaseBusy):
     return JSONResponse({"detail": "Database is busy (a `bearings load/profile/relate` is running). Try again when it finishes."}, status_code=503)
+
+
+def _remote_error_handler():
+    try:
+        from .remote import RemoteError
+    except Exception:  # pragma: no cover
+        return
+
+    @app.exception_handler(RemoteError)
+    async def remote_error(_: Request, e):  # noqa: ANN001
+        return JSONResponse({"detail": f"Databricks: {e}"}, status_code=400)
+
+
+_remote_error_handler()
 
 
 def jsonable(v):
@@ -57,6 +79,33 @@ def _table_or_404(cat, schema, table):
     return tb
 
 
+def remote_hint(schema: str, table: str) -> str:
+    return (f"{schema}.{table} is a remote Databricks table – its rows aren't in the local database. Profile it on Databricks "
+            f"(⚡ Profile / bearings profile -t {schema}.{table}), or copy a sample with:  bearings pull {schema}.{table} --rows 100000")
+
+
+def _use_remote(tb, remote: bool) -> bool:
+    """Local first: a cached (or local) table runs in DuckDB unless Remote is asked for; a table that isn't
+    cached can only run on Databricks."""
+    return catalog.is_remote(tb) or bool(remote and tb.get("remote"))
+
+
+def _source(tb, remote_used: bool) -> dict:
+    if remote_used:
+        return {"source": "remote"}
+    if tb.get("storage") == "sample":
+        c = (tb.get("remote") or {}).get("cache") or {}
+        return {"source": "sample", "cached_rows": c.get("rows"), "total_rows": c.get("total")}
+    return {"source": tb.get("storage") or "local"}
+
+
+def _local_or_409(tb):
+    """Row-level features need the rows in DuckDB (live remote queries are a later phase)."""
+    if catalog.is_remote(tb):
+        raise HTTPException(409, remote_hint(tb["schema"], tb["table"]))
+    return tb
+
+
 # ---------------------------------------------------------------- catalog / search
 def _default_scope():
     return [x for x in os.environ.get("BEARINGS_SCHEMAS", "").split(",") if x]
@@ -74,11 +123,20 @@ def stats(schemas: str | None = None):
     cat = catalog.scoped(full, sc)
     ts = cat["tables"].values()
     per = {}
+    with ro(DB) as con:
+        srcs = remote_aliases(con)
+    for a, src in srcs.items():  # attached schemas show up even before their first table syncs
+        per[a] = {"schema": a, "tables": 0, "columns": 0, "rows": 0}
     for t in full["tables"].values():
         d = per.setdefault(t["schema"], {"schema": t["schema"], "tables": 0, "columns": 0, "rows": 0})
         d["tables"] += 1
         d["columns"] += len(t["columns"])
         d["rows"] += t["row_count"] or 0
+    for a, src in srcs.items():
+        per[a].update(kind="remote", connection=src["connection"], catalog=src["catalog"], remote_schema=src["schema"],
+                      synced_at=str(src["synced_at"]) if src["synced_at"] else None)
+    for d in per.values():
+        d.setdefault("kind", "local")
     rel = sum(1 for r in rels if not sc or (r["from_schema"] in sc and r["to_schema"] in sc))
     return {"db": str(DB), "exists": True, "tables": len(ts), "columns": sum(len(t["columns"]) for t in ts),
             "profiled": sum(1 for t in ts if t["profiled"]), "relationships": rel,
@@ -94,7 +152,8 @@ def tables(schemas: str | None = None):
 
 @app.get("/api/search")
 def search(q: str, mode: str = "name", exact: bool = False, match: str = "fuzzy", columns_only: bool = False,
-           schemas: str | None = None):
+           schemas: str | None = None, remote: bool = False, max_remote: int = 50):
+    """remote=true (value mode): also scan remote tables in scope live on Databricks (one query per table)."""
     if not q.strip():
         return {"query": q, "mode": mode, "has_column_matches": False, "tables": []}
     if match not in ("exact", "contains", "fuzzy"):
@@ -104,6 +163,31 @@ def search(q: str, mode: str = "name", exact: bool = False, match: str = "fuzzy"
         t0 = time.time()
         res = (catalog.search_values(con, cat, q, exact=exact) if mode == "value"
                else catalog.search(cat, q, match=match, columns_only=columns_only))
+    if mode == "value":  # hits in a cached sample may miss rows that only exist on Databricks
+        for t in res["tables"]:
+            if t.get("storage") == "sample":
+                t["partial"] = True
+                for m in t["matched_columns"]:
+                    m["matched_by"] = "value (cached sample)"
+    if mode == "value" and remote:
+        from .remote import query as rq
+        rem = [tb for tb in cat["tables"].values() if catalog.is_remote(tb) or tb.get("storage") == "sample"]
+        todo = rem[:max(1, min(max_remote, 200))]
+        live = {}
+        found, errors = rq.value_search_many(todo, q.strip(), exact)  # DuckDB released; tables in parallel
+        for tb in todo:
+            hits = found.get((tb["schema"], tb["table"]))
+            if hits:
+                by = {c["column"]: c for c in tb["columns"]}
+                matched = [{**catalog._col_summary(by[h["column"]]), "score": 100, "matched_by": "value (live on Databricks)",
+                            "hits": h["hits"], "examples": h["examples"], "live": True} for h in hits]
+                matched.sort(key=lambda x: -x["hits"])
+                live[(tb["schema"], tb["table"])] = {**catalog._table_summary(tb), "score": 100, "table_score": 0, "table_matched_by": None,
+                                                     "matched_columns": matched, "hits": sum(m["hits"] for m in matched), "live": True}
+        res["tables"] = [t for t in res["tables"] if (t["schema"], t["table"]) not in {(x["schema"], x["table"]) for x in todo}] + list(live.values())
+        res["tables"].sort(key=lambda x: -x["hits"])
+        res.update(has_column_matches=bool(res["tables"]), remote_searched=len(todo) - len(errors), remote_errors=errors,
+                   remote_not_searched=len(rem) - len(todo), skipped_remote=0, searched_remote_cached=0)
     res["elapsed_ms"] = round((time.time() - t0) * 1000)
     return jsonable(res)
 
@@ -124,13 +208,21 @@ def table_detail(schema: str, table: str):
 
 @app.get("/api/table/{schema}/{table}/sample")
 def sample(schema: str, table: str, n: int = 20, columns: str | None = None, nonnull: str | None = None,
-           where: str | None = None, seed: int | None = None):
+           where: str | None = None, seed: int | None = None, remote: bool = False):
     n = max(1, min(n, 1000))
     with ro(DB) as con:
         cat = catalog.build(con, DB)
         tb = _table_or_404(cat, schema, table)
-        valid = {c["column"] for c in tb["columns"]}
-        cols = [c for c in (columns.split(",") if columns else []) if c in valid] or [c["column"] for c in tb["columns"]]
+    valid = {c["column"] for c in tb["columns"]}
+    cols = [c for c in (columns.split(",") if columns else []) if c in valid] or [c["column"] for c in tb["columns"]]
+    if _use_remote(tb, remote):  # live on the SQL warehouse
+        from .remote import query as rq
+        r = rq.sample(tb["remote"], tb["remote"]["table"], cols, n, [c for c in (nonnull.split(",") if nonnull else []) if c in valid],
+                      where, seed, tb.get("row_count"))
+        types = {c["column"]: c["type"] for c in tb["columns"]}
+        return jsonable({"columns": r["columns"], "types": [types.get(c, t) for c, t in zip(r["columns"], r["types"])],
+                         "rows": r["rows"], "sql": r["sql"], "remote": True, "elapsed_ms": r["elapsed_ms"], **_source(tb, True)})
+    with ro(DB) as con:
         conds = [f"{qi(c)} IS NOT NULL" for c in (nonnull.split(",") if nonnull else []) if c in valid]
         if where:
             if re.search(r";|\b(insert|update|delete|drop|create|alter|attach|copy|install|load|pragma|set)\b", where, re.I):
@@ -145,7 +237,7 @@ def sample(schema: str, table: str, n: int = 20, columns: str | None = None, non
             raise HTTPException(400, str(e).split("\n")[0])
         rows = cur.fetchall()
         types = {c["column"]: c["type"] for c in tb["columns"]}
-    return jsonable({"columns": cols, "types": [types[c] for c in cols], "rows": rows, "sql": sql})
+    return jsonable({"columns": cols, "types": [types[c] for c in cols], "rows": rows, "sql": sql, **_source(tb, False)})
 
 
 @app.get("/api/table/{schema}/{table}/profile")
@@ -161,6 +253,7 @@ def table_profile(schema: str, table: str, live: bool = False, column: str | Non
                 live = True  # fall through to live compute for that column
             else:
                 return jsonable({"stored": tp is not None, "table": tp, "columns": list(cp.values())})
+        _local_or_409(cat["tables"][(schema, table)])
         t0 = time.time()
         tp, cols = profiler.profile_table(con, schema, table, columns=[column] if column else None, sample_rows=sample_rows)
     return jsonable({"stored": False, "live": True, "elapsed_ms": round((time.time() - t0) * 1000), "table": tp, "columns": cols})
@@ -180,17 +273,23 @@ def uniqueness(schema: str, table: str, body: dict = Body(...)):
     with ro(DB) as con:
         cat = catalog.build(con, DB)
         tb = _table_or_404(cat, schema, table)
-        valid = {c["column"] for c in tb["columns"]}
-        cols = [c for c in cols if c in valid]
-        if not cols:
-            raise HTTPException(400, "Pick at least one column")
+    valid = {c["column"] for c in tb["columns"]}
+    cols = [c for c in cols if c in valid]
+    if not cols:
+        raise HTTPException(400, "Pick at least one column")
+    if _use_remote(tb, bool(body.get("remote"))):
+        from .remote import query as rq
+        r = rq.uniqueness(tb["remote"], tb["remote"]["table"], cols)
+        return jsonable({"columns": cols, **r, "is_unique": r["rows"] == r["distinct"] and r["rows_with_nulls"] == 0, "remote": True,
+                         **_source(tb, True)})
+    with ro(DB) as con:
         key = ", ".join(qi(c) for c in cols)
         rows, distinct, nulls = con.execute(
             f"""SELECT count(*), (SELECT count(*) FROM (SELECT DISTINCT {key} FROM {fq(schema, table)})),
                        count(*) FILTER (WHERE {' OR '.join(f'{qi(c)} IS NULL' for c in cols)}) FROM {fq(schema, table)}""").fetchone()
         dups = con.execute(f"""SELECT {key}, count(*) n FROM {fq(schema, table)} GROUP BY ALL HAVING count(*) > 1 ORDER BY n DESC LIMIT 10""").fetchall()
     return jsonable({"columns": cols, "rows": rows, "distinct": distinct, "rows_with_nulls": nulls,
-                     "is_unique": rows == distinct and nulls == 0, "duplicate_examples": [list(d) for d in dups]})
+                     "is_unique": rows == distinct and nulls == 0, "duplicate_examples": [list(d) for d in dups], **_source(tb, False)})
 
 
 # ---------------------------------------------------------------- multi-table lookup
@@ -256,9 +355,23 @@ def lookup(body: dict = Body(...)):
                 res.update(error="No matching column in this table", count=0, rows=[])
                 out.append(res)
                 continue
+            res.update(_source(tb, _use_remote(tb, bool(body.get("remote")))))
+            if _use_remote(tb, bool(body.get("remote"))):  # run after the DuckDB connection is released
+                res.update(remote=True, _remote=(tb["remote"], tb["remote"]["table"], [(c, types[c]) for c in cols]))
+                out.append(res)
+                continue
             parts, params = [], []
+            masked = set(((tb.get("remote") or {}).get("cache") or {}).get("masked") or [])
+            salt_ = None
+            if masked & set(cols) and op in ("=", "!="):
+                r_ = con.execute(f"SELECT value FROM {META}.settings WHERE key='pii_salt'").fetchone()
+                salt_ = r_[0] if r_ else None
             for c in cols:
-                cond, p = _cond(c, types[c], op, values)
+                vals = values
+                if salt_ and c in masked:  # the cache holds hashed PII: hash the typed value the same way
+                    from .remote.pii import mask_value
+                    vals = [mask_value(v, salt_, "@" in v) for v in values]
+                cond, p = _cond(c, types[c], op, vals)
                 parts.append(cond)
                 params += p
             where = " OR ".join(f"({x})" for x in parts)
@@ -275,6 +388,14 @@ def lookup(body: dict = Body(...)):
             except Exception as e:
                 res.update(error=str(e).split("\n")[0], count=0, rows=[])
             out.append(res)
+    for res in out:
+        if "_remote" in res:
+            from .remote import query as rq
+            src, tbl_name, cols_t = res.pop("_remote")
+            try:
+                res.update(rq.lookup(src, tbl_name, cols_t, op, values, limit))
+            except Exception as e:
+                res.update(error=f"Databricks: {str(e).splitlines()[0]}", count=0, rows=[])
     return jsonable({"op": op, "values": values, "limit": limit, "results": out})
 
 
@@ -304,17 +425,24 @@ def overlap(left: str, right: str):
     rs, rt, rc = _split(right)
     with ro(DB) as con:
         cat = catalog.build(con, DB)
-        _table_or_404(cat, ls, lt)
-        _table_or_404(cat, rs, rt)
-        a, m = relationships.overlap(con, ls, lt, lc, rs, rt, rc)
-        b, m2 = relationships.overlap(con, rs, rt, rc, ls, lt, lc)
+        tl, tr = _table_or_404(cat, ls, lt), _table_or_404(cat, rs, rt)
+        local = {(s_, t_) for (s_, t_), tb in cat["tables"].items() if not catalog.is_remote(tb)}
+        try:
+            a, m = relationships.overlap(con, ls, lt, lc, rs, rt, rc, local=local)
+            b, m2 = relationships.overlap(con, rs, rt, rc, ls, lt, lc, local=local)
+            a_sql, a_p, a_full = relationships._values(con, ls, lt, lc, local)
+            b_sql, b_p, b_full = relationships._values(con, rs, rt, rc, local)
+        except relationships.NoValues as e:
+            raise HTTPException(409, f"{e} is a remote column without a key fingerprint. Profile its table on Databricks first "
+                                     f"(bearings profile -t {e.args[0].rsplit('.', 1)[0]}) or pull it.")
         orphans = [r[0] for r in con.execute(
-            f"""SELECT DISTINCT CAST({qi(lc)} AS VARCHAR) v FROM {fq(ls, lt)} WHERE {qi(lc)} IS NOT NULL
-                AND CAST({qi(lc)} AS VARCHAR) NOT IN (SELECT CAST({qi(rc)} AS VARCHAR) FROM {fq(rs, rt)} WHERE {qi(rc)} IS NOT NULL) LIMIT 10""").fetchall()]
+            f"SELECT v FROM ({a_sql}) WHERE v NOT IN (SELECT v FROM ({b_sql})) LIMIT 10", a_p + b_p).fetchall()]
+    via = [f"{x['schema']}.{x['table']}" for x in (tl, tr) if catalog.is_remote(x)]
     return {"left": left, "right": right, "left_distinct": a, "left_in_right": m,
             "left_in_right_pct": round(100 * m / a, 2) if a else 0, "right_distinct": b, "right_in_left": m2,
             "right_in_left_pct": round(100 * m2 / b, 2) if b else 0, "left_orphans": orphans,
-            "name_score": relationships.name_score(lc, rt, rc)}
+            "name_score": relationships.name_score(lc, rt, rc),
+            "via_fingerprints": via, "complete": a_full and b_full}
 
 
 # ---------------------------------------------------------------- annotations
@@ -384,6 +512,12 @@ def run_sql(body: dict = Body(...)):
     limit = max(1, min(int(body.get("limit") or 1000), 10000))
     if not sql:
         raise HTTPException(400, "Empty query")
+    engine = body.get("engine") or "duckdb"
+    if engine.startswith("databricks:"):
+        from .remote import query as rq
+        with ro(DB) as con:
+            srcs = remote_aliases(con)
+        return jsonable(rq.console(engine.split(":", 1)[1], sql, srcs, limit))
     if ";" in sql:
         raise HTTPException(400, "One statement at a time")
     if not re.match(r"^\s*(select|with|from|describe|show|summarize|explain|values|pivot|unpivot|table)\b", sql, re.I):
@@ -396,10 +530,267 @@ def run_sql(body: dict = Body(...)):
             types = [str(d[1]) for d in cur.description] if cur.description else []
             rows = cur.fetchmany(limit + 1)
         except Exception as e:
-            raise HTTPException(400, str(e))
+            msg = str(e)
+            if "does not exist" in msg:
+                aliases = remote_aliases(con)
+                hit = next((a for a in aliases if re.search(rf"\b{re.escape(a)}\s*\.", sql, re.I)), None)
+                if hit:
+                    msg += (f"\n\n'{hit}' is a remote Databricks schema: its rows aren't in the local database. "
+                            f"Switch the engine to Databricks to query it live, or copy a sample with  bearings pull {hit}.<table> --rows 100000")
+            raise HTTPException(400, msg)
     truncated = len(rows) > limit
     return jsonable({"columns": cols, "types": types, "rows": rows[:limit], "truncated": truncated,
                      "elapsed_ms": round((time.time() - t0) * 1000)})
+
+
+# ---------------------------------------------------------------- remote (Databricks) sources
+_jobs: dict[str, dict] = {}
+_jobs_lock = threading.Lock()
+
+
+def _remote_enabled() -> bool:
+    try:
+        import databricks.sdk  # noqa: F401
+        import databricks.sql  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+@app.get("/api/remote")
+def remote_overview():
+    """Attached remote schemas, known connection profiles and running sync jobs."""
+    from .remote import connections as cx
+    try:
+        conns = [{"name": c.name, "host": c.host, "warehouse_id": c.warehouse_id, "profile": c.profile}
+                 for c in cx.load_all().values()]
+    except Exception as e:  # a broken connections.toml shouldn't break the app
+        conns, err = [], str(e)
+    else:
+        err = None
+    sources = []
+    if DB.exists():
+        with ro(DB) as con:
+            srcs = remote_aliases(con)
+            counts = {}
+            if srcs:
+                counts = {a: (n, d) for a, n, d in con.execute(
+                    f"SELECT alias, count(*) FILTER (WHERE NOT dropped), count(*) FILTER (WHERE dropped) FROM {META}.remote_tables GROUP BY 1").fetchall()}
+                last = {a: n for a, n in con.execute(
+                    f"""SELECT alias, count(*) FROM {META}.sync_log l
+                        WHERE synced_at = (SELECT max(synced_at) FROM {META}.sync_log WHERE alias = l.alias) GROUP BY 1""").fetchall()}
+            prof = {a: (n, st) for a, n, st in con.execute(
+                f"SELECT schema_name, count(*), count(*) FILTER (WHERE coalesce(stale, false)) FROM {META}.table_profile GROUP BY 1").fetchall()} \
+                if srcs else {}
+            for a, src in srcs.items():
+                n, d = counts.get(a, (0, 0))
+                pn, ps = prof.get(a, (0, 0))
+                sources.append({**src, "tables": n, "dropped_tables": d, "last_sync_changes": last.get(a, 0),
+                                "profiled": pn, "stale": ps})
+    with _jobs_lock:
+        running = [j for j in _jobs.values() if j["status"] == "running"]
+    return jsonable({"enabled": _remote_enabled(), "connections": conns, "connections_error": err,
+                     "sources": sources, "running_jobs": running})
+
+
+def _run_sync_job(job_id: str, aliases: list[str], dry_run: bool):
+    from .remote import sync as rsync
+    job = _jobs[job_id]
+    for a in aliases:
+        job["current"] = a
+        try:
+            job["results"].append(rsync.sync(DB, a, dry_run=dry_run))
+        except Exception as e:
+            job["errors"].append({"alias": a, "error": str(e).splitlines()[0] if str(e) else type(e).__name__})
+    job.update(status="failed" if job["errors"] and not job["results"] else "done", current=None,
+               finished_at=dt.datetime.now().isoformat(timespec="seconds"))
+
+
+@app.post("/api/remote/sync")
+def remote_sync(body: dict = Body(default={})):
+    """Re-sync remote metadata. body = {aliases?: [...], catalog?: str, connection?: str, dry_run?: bool, wait?: bool}.
+    Runs in the background (returns a job id) unless wait=true."""
+    from .remote import RemoteError
+    from .remote import sync as rsync
+    try:
+        aliases = rsync.aliases_for(DB, body.get("aliases") or None, body.get("catalog"), body.get("connection"))
+    except RemoteError as e:
+        raise HTTPException(400, str(e))
+    if not aliases:
+        raise HTTPException(400, "No attached remote schemas match")
+    with _jobs_lock:
+        busy = [j for j in _jobs.values() if j["status"] == "running" and j.get("kind") == "sync" and set(j["aliases"]) & set(aliases)]
+        if busy:
+            return jsonable(busy[0])
+        job_id = uuid.uuid4().hex[:12]
+        _jobs[job_id] = {"id": job_id, "kind": "sync", "aliases": aliases, "status": "running", "current": None, "results": [], "errors": [],
+                         "dry_run": bool(body.get("dry_run")), "started_at": dt.datetime.now().isoformat(timespec="seconds")}
+    if body.get("wait"):
+        _run_sync_job(job_id, aliases, bool(body.get("dry_run")))
+    else:
+        threading.Thread(target=_run_sync_job, args=(job_id, aliases, bool(body.get("dry_run"))), daemon=True).start()
+    return jsonable(_jobs[job_id])
+
+
+def _run_profile_job(job_id: str, targets: list[tuple[str, str]], sample_rows: int | None):
+    from .remote import profile as rprofile
+    job = _jobs[job_id]
+    for a, t in targets:
+        job["current"] = f"{a}.{t}"
+        try:
+            job["results"].append(rprofile.profile_table(DB, a, t, sample_rows=sample_rows or rprofile.DEFAULT_SAMPLE))
+        except Exception as e:
+            job["errors"].append({"alias": f"{a}.{t}", "error": str(e).splitlines()[0] if str(e) else type(e).__name__})
+        job["done"] = len(job["results"]) + len(job["errors"])
+    job.update(status="failed" if job["errors"] and not job["results"] else "done", current=None,
+               finished_at=dt.datetime.now().isoformat(timespec="seconds"))
+
+
+@app.post("/api/remote/profile")
+def remote_profile(body: dict = Body(default={})):
+    """Profile metadata-only remote tables on the SQL warehouse (background job).
+    body = {aliases?: [...], tables?: ["alias.table"], only_new?: bool, only_stale?: bool, sample_rows?: int, wait?: bool}"""
+    from .remote import profile as rprofile
+    targets = rprofile.targets(DB, body.get("aliases") or None, body.get("tables") or None,
+                               bool(body.get("only_new")), bool(body.get("only_stale")))
+    if not targets:
+        raise HTTPException(400, "Nothing to profile (no matching metadata-only remote tables)")
+    keys = [f"{a}.{t}" for a, t in targets]
+    with _jobs_lock:
+        busy = [j for j in _jobs.values() if j["status"] == "running" and j.get("kind") == "profile" and set(j["aliases"]) & set(keys)]
+        if busy:
+            return jsonable(busy[0])
+        job_id = uuid.uuid4().hex[:12]
+        _jobs[job_id] = {"id": job_id, "kind": "profile", "aliases": keys, "total": len(keys), "done": 0, "status": "running",
+                         "current": None, "results": [], "errors": [], "started_at": dt.datetime.now().isoformat(timespec="seconds")}
+    args = (job_id, targets, body.get("sample_rows"))
+    if body.get("wait"):
+        _run_profile_job(*args)
+    else:
+        threading.Thread(target=_run_profile_job, args=args, daemon=True).start()
+    return jsonable(_jobs[job_id])
+
+
+def _run_pull_job(job_id: str, targets: list[str], rows: int | None, use_policy: bool = False):
+    from .remote import pull as rpull
+    job = _jobs[job_id]
+    for ref in targets:
+        job["current"] = ref
+        try:
+            if use_policy:  # the schema's cache setting: whole up to N rows, an N-row sample of bigger tables
+                r = rpull.cache(DB, aliases=[ref.split(".", 1)[0]], tables=[ref], refresh=True)
+                if r and "error" in r[0]:
+                    raise RuntimeError(r[0]["error"])
+                job["results"] += r
+            else:
+                job["results"].append(rpull.pull(DB, ref, rows=rows))
+        except Exception as e:
+            job["errors"].append({"alias": ref, "error": str(e).splitlines()[0] if str(e) else type(e).__name__})
+        job["done"] = len(job["results"]) + len(job["errors"])
+    catalog._cache["key"] = None
+    job.update(status="failed" if job["errors"] and not job["results"] else "done", current=None,
+               finished_at=dt.datetime.now().isoformat(timespec="seconds"))
+
+
+@app.post("/api/remote/pull")
+def remote_pull(body: dict = Body(...)):
+    """Copy remote tables into DuckDB (background job). body = {tables: ["alias.table"], rows?: N (random sample),
+    cache?: true (use the schema's cache setting instead of rows)}"""
+    targets = [t for t in body.get("tables") or [] if "." in t]
+    if not targets:
+        raise HTTPException(400, "Give tables as alias.table")
+    with _jobs_lock:
+        busy = [j for j in _jobs.values() if j["status"] == "running" and j.get("kind") == "pull" and set(j["aliases"]) & set(targets)]
+        if busy:
+            return jsonable(busy[0])
+        job_id = uuid.uuid4().hex[:12]
+        _jobs[job_id] = {"id": job_id, "kind": "pull", "aliases": targets, "total": len(targets), "done": 0, "status": "running",
+                         "current": None, "results": [], "errors": [], "started_at": dt.datetime.now().isoformat(timespec="seconds")}
+    args = (job_id, targets, body.get("rows"), bool(body.get("cache")))
+    if body.get("wait"):
+        _run_pull_job(*args)
+    else:
+        threading.Thread(target=_run_pull_job, args=args, daemon=True).start()
+    return jsonable(_jobs[job_id])
+
+
+@app.post("/api/remote/warm")
+def remote_warm(body: dict = Body(default={})):
+    """Wake the SQL warehouse(s) behind the attached schemas (or one connection) in the background."""
+    from .remote import query as rq
+    conns = _warehouse_connections(body.get("connection"))
+    return {c: rq.warm(c) for c in conns}
+
+
+@app.get("/api/remote/warm")
+def remote_warm_status():
+    from .remote import query as rq
+    return {c: rq.warm_status(c) for c in _warehouse_connections(None)}
+
+
+def _warehouse_connections(only: str | None) -> list[str]:
+    if not _remote_enabled() or not DB.exists():
+        return []
+    from .remote import connections as cx
+    with ro(DB) as con:
+        used = {s_["connection"] for s_ in remote_aliases(con).values()}
+    try:
+        conns = cx.load_all()
+    except Exception:
+        return []
+    return [c for c in sorted(used) if c in conns and conns[c].warehouse_id and (not only or c == only)]
+
+
+def _warm_on_start():
+    if os.environ.get("BEARINGS_REMOTE_WARM", "1") == "0":
+        return
+    try:
+        from .remote import query as rq
+        for c in _warehouse_connections(None):
+            rq.warm(c)
+    except Exception:  # never block the app from starting
+        pass
+
+
+@app.get("/api/remote/jobs/{job_id}")
+def remote_job(job_id: str):
+    job = _jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "No such job")
+    return jsonable(job)
+
+
+@app.get("/api/remote/changes")
+def remote_changes(alias: str | None = None, limit: int = 200):
+    from .remote import sync as rsync
+    if not DB.exists():
+        return []
+    with ro(DB) as con:
+        return jsonable(rsync.recent_changes(con, alias, max(1, min(limit, 5000))))
+
+
+@app.get("/api/annotations/orphans")
+def annotation_orphans(schemas: str | None = None):
+    """Annotations whose column (or remote table) no longer exists, with remap suggestions."""
+    from . import orphans
+    with ro(DB) as con:
+        cat = catalog.build(con, DB)
+        aliases = set(remote_aliases(con))
+    return jsonable(orphans.find(cat, catalog.annotations(DB), aliases, catalog.parse_schemas(schemas)))
+
+
+@app.post("/api/annotations/remap")
+def annotation_remap(body: dict = Body(...)):
+    """body = {schema, table, column, new_column, new_table?}"""
+    from . import orphans
+    try:
+        res = orphans.remap(DB, body["schema"], body["table"], body.get("column", ""), body["new_column"], body.get("new_table"))
+    except KeyError as e:
+        raise HTTPException(404 if "No annotation" in str(e) else 400, str(e).strip("'\""))
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+    catalog._cache["key"] = None
+    return res
 
 
 # ---------------------------------------------------------------- UI

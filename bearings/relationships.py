@@ -6,7 +6,7 @@ from datetime import datetime
 
 from rapidfuzz import fuzz
 
-from .db import META, fq, qi
+from .db import META, fq, has_meta, qi, user_tables
 from .profiler import family
 
 ID_SUFFIX = re.compile(r"(_?(id|key|code|no|num|nbr|number|cd|ref))$", re.I)
@@ -40,13 +40,35 @@ def name_score(from_col: str, to_table: str, to_col: str) -> float:
     return round(r, 3)
 
 
-def overlap(con, fs, ft, fc, ts, tt, tc) -> tuple[int, int]:
-    """(distinct values in from-column, how many of them exist in to-column)."""
+class NoValues(RuntimeError):
+    """A remote (metadata-only) column has no key fingerprint, so its values can't be compared."""
+
+
+def _values(con, s, t, c, local: set | None = None) -> tuple[str, list, bool]:
+    """SQL for the distinct values of a column as VARCHAR, from the table itself when it's local, else
+    from its key fingerprint. Returns (sql, params, complete)."""
+    if local is None:
+        local = set(user_tables(con))
+    if (s, t) in local:
+        return f"SELECT DISTINCT CAST({qi(c)} AS VARCHAR) v FROM {fq(s, t)} WHERE {qi(c)} IS NOT NULL", [], True
+    if has_meta(con, "key_fingerprint"):
+        r = con.execute(f"SELECT complete FROM {META}.key_fingerprint WHERE schema_name=? AND table_name=? AND column_name=?",
+                        [s, t, c]).fetchone()
+        if r:
+            return (f"SELECT DISTINCT v FROM {META}.key_values WHERE schema_name=? AND table_name=? AND column_name=?",
+                    [s, t, c], bool(r[0]))
+    raise NoValues(f"{s}.{t}.{c}")
+
+
+def overlap(con, fs, ft, fc, ts, tt, tc, local: set | None = None) -> tuple[int, int]:
+    """(distinct values in from-column, how many of them exist in to-column). Remote (metadata-only)
+    columns are compared through their key fingerprints (`bearings profile` on a remote schema)."""
+    a_sql, a_p, _ = _values(con, fs, ft, fc, local)
+    b_sql, b_p, _ = _values(con, ts, tt, tc, local)
     q = f"""
-      WITH a AS (SELECT DISTINCT CAST({qi(fc)} AS VARCHAR) v FROM {fq(fs, ft)} WHERE {qi(fc)} IS NOT NULL),
-           b AS (SELECT DISTINCT CAST({qi(tc)} AS VARCHAR) v FROM {fq(ts, tt)} WHERE {qi(tc)} IS NOT NULL)
+      WITH a AS ({a_sql}), b AS ({b_sql})
       SELECT (SELECT count(*) FROM a), (SELECT count(*) FROM a SEMI JOIN b ON a.v = b.v)"""
-    a, m = con.execute(q).fetchone()
+    a, m = con.execute(q, a_p + b_p).fetchone()
     return int(a or 0), int(m or 0)
 
 
@@ -94,9 +116,14 @@ def discover(con, min_overlap: float = 0.5, name_threshold: float = 0.75, deep: 
         candidates = candidates[:max_pairs]
     echo(f"  checking value overlap for {len(candidates)} candidate pairs…")
     found = []
+    local = set(user_tables(con))
+    no_values = 0
     for ns, f, t, method in candidates:
         try:
-            a, m = overlap(con, f["s"], f["t"], f["c"], t["s"], t["t"], t["c"])
+            a, m = overlap(con, f["s"], f["t"], f["c"], t["s"], t["t"], t["c"], local=local)
+        except NoValues:
+            no_values += 1
+            continue
         except Exception:
             continue
         if not a:
@@ -109,6 +136,8 @@ def discover(con, min_overlap: float = 0.5, name_threshold: float = 0.75, deep: 
                 "name_score": ns, "overlap_pct": round(100 * ov, 2), "from_distinct": a, "matched_distinct": m,
                 "confidence": round(0.65 * ov + 0.35 * ns, 3), "method": method,
             })
+    if no_values:
+        echo(f"  {no_values} pair(s) skipped: a remote column has no key fingerprint (bearings profile -s <remote alias>)")
     # keep best target per from-column (plus any others within 0.05 of best)
     best: dict = {}
     for r in found:
