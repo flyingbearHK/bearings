@@ -1,0 +1,22 @@
+# --- your data never goes to git ---
+data/
+demo/
+exports/
+hms_data/
+*.duckdb
+*.duckdb.wal
+*.sqlite
+*.parquet
+*.csv
+*.xlsx
+*.zip
+.env
+.env.*
+
+# --- python / node / os ---
+.venv/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+web/node_modules/
+.DS_Store
