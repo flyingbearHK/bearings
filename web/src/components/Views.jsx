@@ -1,12 +1,17 @@
 import React, { useEffect, useMemo, useState } from 'react'
-import { api, exportUrl, fmt, store } from '../api.js'
+import { api, exportUrl, fmt, saveFile, store } from '../api.js'
 import { Bar, Tags } from './Charts.jsx'
 import DataGrid, { Cell, Hl } from './DataGrid.jsx'
+import CompareDialog from './CompareDialog.jsx'
+import ErdDialog from './ErdDialog.jsx'
+import { Card } from './TableDetail.jsx'
 
-export function RelationshipsView({ onOpenTable, scope }) {
+export function RelationshipsView({ onOpenTable, scope, onOpenSql }) {
   const [rows, setRows] = useState(null)
   const [f, setF] = useState('')
   const [min, setMin] = useState(0)
+  const [erdOpen, setErdOpen] = useState(false)
+  const [cmp, setCmp] = useState(null)
   useEffect(() => { api.relationships({ schemas: scope }).then(setRows) }, [scope])
   const shown = useMemo(() => (rows || []).filter((r) =>
     r.confidence >= min && (!f || `${r.from_table}.${r.from_column} ${r.to_table}.${r.to_column}`.toLowerCase().includes(f.toLowerCase()))), [rows, f, min])
@@ -18,16 +23,29 @@ export function RelationshipsView({ onOpenTable, scope }) {
         <label className="check">min confidence
           <select value={min} onChange={(e) => setMin(Number(e.target.value))}>{[0, 0.6, 0.8, 0.9].map((x) => <option key={x} value={x}>{x}</option>)}</select></label>
         <span className="muted small">{shown.length} of {rows.length} · discovered by <code>bearings relate</code> (name similarity + value overlap)</span>
+        <span className="spacer" />
+        <button className="btn" disabled={!shown.length}
+          title="Draw an ER diagram of the relationships shown (filter first), then untick the entities you don't want. Download as Mermaid (.mmd) or picture (.svg)."
+          onClick={() => setErdOpen(true)}>◇ ER diagram{f || min ? ` (${shown.length} links)` : ''}</button>
       </div>
+      {cmp && <CompareDialog left={cmp[0]} right={cmp[1]} onClose={() => setCmp(null)} onOpenSql={onOpenSql} />}
+      {erdOpen && <ErdDialog rels={shown} scope={scope} minConfidence={min} onClose={() => setErdOpen(false)}
+        onOpenTable={(s, t) => onOpenTable(s, t)} />}
       <DataGrid rows={shown} id="rels" highlight={f} empty="No relationships. Run: bearings profile && bearings relate" columns={[
         { key: 'from', label: 'From (FK)', render: (r) => <button className="link mono" onClick={() => onOpenTable(r.from_schema, r.from_table, r.from_column)}><Hl text={`${r.from_table}.${r.from_column}`} /></button>, value: (r) => r.from_table + '.' + r.from_column },
         { key: 'arrow', label: '', render: () => '→', width: 24 },
         { key: 'to', label: 'To (key)', render: (r) => <button className="link mono" onClick={() => onOpenTable(r.to_schema, r.to_table, r.to_column)}><Hl text={`${r.to_table}.${r.to_column}`} /></button>, value: (r) => r.to_table + '.' + r.to_column },
+        { key: 'cardinality', label: 'Cardinality', render: (r) => <Card r={r} />, value: (r) => r.cardinality },
+        { key: 'child_avg', label: 'Per parent', title: 'Child rows per parent: average (max)', render: (r) => r.child_avg != null ? <span>{fmt.n(r.child_avg)} <span className="muted small">(max {fmt.n(r.child_max)})</span></span> : '', value: (r) => r.child_avg, align: 'right' },
+        { key: 'parent_no_child_pct', label: 'Parents w/o children', render: (r) => r.parent_no_child_pct != null ? fmt.pct(r.parent_no_child_pct) : '', value: (r) => r.parent_no_child_pct, align: 'right' },
+        { key: 'orphan_rows', label: 'Orphan rows', render: (r) => r.orphan_rows ? <span className="warn-text">{fmt.n(r.orphan_rows)}</span> : r.orphan_rows === 0 ? '0' : '', value: (r) => r.orphan_rows, align: 'right' },
         { key: 'overlap_pct', label: 'Overlap', render: (r) => <span className="numbar"><Bar pct={r.overlap_pct} tone="good" width={70} />{fmt.pct(r.overlap_pct)}</span>, align: 'right' },
         { key: 'from_distinct', label: 'FK distinct', render: (r) => fmt.n(r.from_distinct), align: 'right' },
         { key: 'name_score', label: 'Name sim.', render: (r) => r.name_score.toFixed(2), align: 'right' },
         { key: 'confidence', label: 'Confidence', render: (r) => <b>{r.confidence.toFixed(2)}</b>, align: 'right' },
         { key: 'method', label: 'Method', render: (r) => <span className="muted small">{r.method}</span> },
+        { key: 'cmp', label: '', render: (r) => r.cardinality ? <button className="link small" title="Compare the attributes of the linked records (e.g. is the e-mail the same in both systems?)"
+            onClick={() => setCmp([`${r.from_schema}.${r.from_table}.${r.from_column}`, `${r.to_schema}.${r.to_table}.${r.to_column}`])}>⇄ compare</button> : '' },
       ]} />
     </div>
   )
@@ -45,6 +63,8 @@ export function AnnotationsView({ onOpenTable, refreshKey, scope }) {
         <input className="grow" placeholder="Filter annotations…" value={f} onChange={(e) => setF(e.target.value)} />
         <a className="btn" href={exportUrl('xlsx', scope)}>Export mapping workbook (.xlsx)</a>
         <a className="btn" href={exportUrl('json', scope)}>Export JSON</a>
+        <button className="btn" title="Suggested data-quality rules for every table in scope: Databricks DQX, Great Expectations and Purview (.zip)"
+          onClick={async () => { const { blob, name } = await api.dqExport({ schemas: scope ? scope.split(',') : undefined, format: 'zip' }); saveFile(blob, name) }}>⤓ DQ rules</button>
       </div>
       <DataGrid rows={shown} id="ann" highlight={f} empty="No annotations yet — open a column's profile (▤) to tag it or map it to a CDM entity" columns={[
         { key: 'table_name', label: 'Table', render: (r) => <button className="link mono" onClick={() => onOpenTable(r.schema_name, r.table_name, r.column_name || null)}>{r.schema_name}.{r.table_name}</button>, value: (r) => r.table_name },

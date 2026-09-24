@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState } from 'react'
 import { api, fmt, store } from '../api.js'
 
 const FORMAT_CHIP = { csv: 'CSV', parquet: 'Parquet', json: 'JSON', excel: 'Excel' }
-const PHASE = { load: 'Loading', comments: 'Importing descriptions', profile: 'Profiling', relate: 'Finding relationships', done: 'Done' }
+const PHASE = { load: 'Loading', comments: 'Importing descriptions', profile: 'Profiling', relate: 'Finding relationships', insights: 'Modelling insights', done: 'Done' }
 const bytes = (n) => (n == null ? '' : n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(0)} KB` : n < 1073741824 ? `${(n / 1048576).toFixed(1)} MB` : `${(n / 1073741824).toFixed(2)} GB`)
 const newBatch = () => `drop_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`
 

@@ -59,6 +59,27 @@ const FLAG_INFO = {
   pii_name_hint: ['PII?', 'Column name suggests personal data', 'pii'],
   mixed_format: ['mixed fmt', 'Several different value shapes', 'warn'],
   has_blanks: ['blanks', 'Contains empty / whitespace strings', 'warn'],
+  placeholders: ['placeholders', 'Has values that mean "no value" (N/A, -, UNKNOWN, 1900-01-01, 0 / -1 in a key…) – see effective null %', 'warn'],
+  type_hint: ['type hint', 'Stored as text, but the values parse as another type (see the column profile)', 'accent'],
+  leading_zeros: ['leading zeros', 'Numeric-looking codes with leading zeros – keep them as text', 'info'],
+  outliers: ['outliers', 'Far-out values beyond 3 × IQR (see the column profile or the Quality tab)', 'warn'],
+  negatives: ['negatives', 'A few negative values in a mostly positive column: refunds, reversals or errors?', 'warn'],
+}
+
+/** Tiny bar chart of counts over time (rows per month). points: [[label, n], …] */
+export function Sparkline({ points, width = 120, height = 20, title }) {
+  if (!points?.length) return null
+  const max = Math.max(...points.map((p) => p[1])) || 1
+  const bw = width / points.length
+  return (
+    <svg className="spark" width={width} height={height} viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none" role="img"
+      aria-label={title || 'Rows over time'}>
+      {points.map(([l, n], i) => {
+        const h = Math.max(n ? 1.5 : 0, (n / max) * (height - 1))
+        return <rect key={i} x={i * bw} y={height - h} width={Math.max(bw - (bw > 3 ? 1 : 0), 0.6)} height={h} className="spark-bar"><title>{`${l}: ${n.toLocaleString()}`}</title></rect>
+      })}
+    </svg>
+  )
 }
 
 export function Flags({ flags }) {

@@ -1,6 +1,10 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
-import { STORAGE, ago, api, copy, fmt, isPII, sourceNote, store } from '../api.js'
-import { Bar, Flags, Tags } from './Charts.jsx'
+import { STORAGE, ago, api, copy, fmt, isPII, monthLabel, sourceNote, store } from '../api.js'
+import { Bar, Flags, Sparkline, Tags } from './Charts.jsx'
+import ErdDialog from './ErdDialog.jsx'
+import CompareDialog from './CompareDialog.jsx'
+import InsightsPanel from './Insights.jsx'
+import QualityPanel from './Quality.jsx'
 import ColumnPicker, { visibleKeys } from './ColumnPicker.jsx'
 import DataGrid, { Cell, Hl } from './DataGrid.jsx'
 import RemoteProfileButton, { PullButton, WarehouseState } from './RemoteProfile.jsx'
@@ -12,6 +16,7 @@ const SCHEMA_FIELDS = [
   { key: 'flags', label: 'Profile flags' }, { key: 'tags', label: 'Tags' }, { key: 'cdm', label: 'CDM mapping' },
   { key: 'comment', label: 'Comment' },
 ]
+export const SAMPLE_SIZES = [30, 200]
 const SCHEMA_DEFAULT = { order: SCHEMA_FIELDS.map((f) => f.key), hidden: ['top', 'distinct_pct'] }
 
 export default function TableDetail({ schema, table, highlight, focusColumn, tab, setTab, onOpenColumn, onOpenTable,
@@ -23,7 +28,7 @@ export default function TableDetail({ schema, table, highlight, focusColumn, tab
   const [uniq, setUniq] = useState(null)
   const [md, setMd] = useState(null)
   const focusRef = useRef(null)
-  const [req, setReq] = useState({ n: 20, only: null, id: 0 })
+  const [req, setReq] = useState({ n: SAMPLE_SIZES[0], only: null, id: 0 })
   const [reload, setReload] = useState(0)
   const [useRemote, setUseRemote] = useState(false)
   const [matchedFirst, setMatchedFirst] = useState(() => store.get('matchedFirst', true))
@@ -65,7 +70,18 @@ export default function TableDetail({ schema, table, highlight, focusColumn, tab
       value: (c) => c.column,
     },
     type: { render: (c) => <span className="mono muted">{c.type}</span>, value: (c) => c.type },
-    null_pct: { render: (c) => c.profile ? <span className="numbar"><Bar pct={c.profile.null_pct} tone={c.profile.null_pct >= 50 ? 'warn' : 'accent'} width={40} />{fmt.pct(c.profile.null_pct)}</span> : '', value: (c) => c.profile?.null_pct, align: 'right' },
+    null_pct: {
+      render: (c) => {
+        if (!c.profile) return ''
+        const eff = c.profile.effective_null_pct
+        const more = eff != null && eff - c.profile.null_pct >= 0.05
+        return (
+          <span className="numbar" title={more ? `${fmt.pct(eff)} effectively empty: nulls + blanks + placeholder values (N/A, -, 1900-01-01…)` : undefined}>
+            <Bar pct={more ? eff : c.profile.null_pct} tone={(more ? eff : c.profile.null_pct) >= 50 ? 'warn' : 'accent'} width={40} />
+            {fmt.pct(c.profile.null_pct)}{more && <span className="eff-null"> · eff. {fmt.pct(eff)}</span>}
+          </span>)
+      },
+      value: (c) => c.profile?.null_pct, align: 'right' },
     distinct_count: { render: (c) => fmt.n(c.profile?.distinct_count), value: (c) => c.profile?.distinct_count, align: 'right' },
     distinct_pct: { render: (c) => fmt.pct(c.profile?.distinct_pct), value: (c) => c.profile?.distinct_pct, align: 'right' },
     min: { render: (c) => <Cell v={c.profile?.min_val ?? ''} masked={workshop && isPII(c)} />, value: (c) => c.profile?.min_val },
@@ -139,9 +155,11 @@ export default function TableDetail({ schema, table, highlight, focusColumn, tab
           </div>
         )}
         {t.comment && <div className="comment-line">{t.comment}</div>}
+        <InsightLine t={t} onOpen={() => setTab('insights')} />
         <div className="toolbar">
           <div className="tabs small-tabs">
-            {[['columns', 'Schema'], ['sample', 'Sample data'], ['profile', 'Profile'], ['rels', `Relationships${t.relationships.length ? ` (${t.relationships.length})` : ''}`]].map(([k, l]) => (
+            {[['columns', 'Schema'], ['sample', 'Sample data'], ['profile', 'Profile'], ['rels', `Relationships${t.relationships.length ? ` (${t.relationships.length})` : ''}`],
+              ['insights', 'Insights'], ['quality', 'Quality']].map(([k, l]) => (
               <button key={k} className={tab === k ? 'active' : ''} onClick={() => setTab(k)}>{l}</button>
             ))}
           </div>
@@ -152,8 +170,7 @@ export default function TableDetail({ schema, table, highlight, focusColumn, tab
               <input type="checkbox" checked={t.kind === 'remote' || useRemote} disabled={t.kind === 'remote'} onChange={(e) => setUseRemote(e.target.checked)} /> ⚡ Remote
             </label>
           )}
-          <button className="btn" onClick={() => sampleRequest(10)}>Sample 10</button>
-          <button className="btn" onClick={() => sampleRequest(20)}>Sample 20</button>
+          {SAMPLE_SIZES.map((x) => <button key={x} className="btn" onClick={() => sampleRequest(x)}>Sample {x}</button>)}
           <button className="btn" onClick={() => setTab('profile')}>Profile</button>
           <button className="btn" title="Markdown table spec for your CDM notes" onClick={async () => setMd(await api.markdown(schema, table))}>Export .md</button>
           <button className="btn" onClick={() => onOpenSql(selectSql)}>Open in SQL</button>
@@ -183,7 +200,7 @@ export default function TableDetail({ schema, table, highlight, focusColumn, tab
             {selected.size > 0 && (
               <>
                 <span className="muted small">{selected.size} selected</span>
-                <button className="btn" onClick={() => sampleRequest(20, [...selected])}>Sample selected</button>
+                <button className="btn" onClick={() => sampleRequest(SAMPLE_SIZES[0], [...selected])}>Sample selected</button>
                 <button className="btn" onClick={checkKey} title="Is this column combination unique?">Check key</button>
                 <button className="link" onClick={() => setSelected(new Set())}>clear</button>
               </>
@@ -214,13 +231,47 @@ export default function TableDetail({ schema, table, highlight, focusColumn, tab
 
       {tab === 'sample' && <SamplePanel key={`${schema}.${table}.${req.id}`} t={t} hl={hl} workshop={workshop} n={req.n} only={req.only} remote={useRemote} term={term} />}
       {tab === 'profile' && <ProfilePanel t={t} onOpenColumn={onOpenColumn} onReload={() => setReload((k) => k + 1)} />}
-      {tab === 'rels' && <RelPanel t={t} allTables={allTables} onOpenTable={onOpenTable} />}
+      {tab === 'rels' && <RelPanel t={t} allTables={allTables} onOpenTable={onOpenTable} onOpenSql={onOpenSql} />}
+      {tab === 'quality' && <QualityPanel t={t} workshop={workshop} onOpenColumn={onOpenColumn} />}
+      {tab === 'insights' && <InsightsPanel t={t} workshop={workshop} onOpenSql={onOpenSql} onOpenColumn={onOpenColumn}
+        onChanged={() => setReload((k) => k + 1)} />}
+    </div>
+  )
+}
+
+/* ------------------------------------------------------------------ header strip: grain + history */
+function InsightLine({ t, onOpen }) {
+  const ins = t.insights
+  if (!ins?.computed_at) return null
+  const g = ins.grain
+  const tm = ins.time
+  const pts = tm?.series?.points || []
+  return (
+    <div className="insight-line small">
+      {g?.combos?.length > 0 && (
+        <span title={g.combos.length > 1 ? `Also unique: ${g.combos.slice(1).map((c) => c.join(' + ')).join(' · ')}` : 'The smallest set of columns that makes a row unique'}>
+          <span className="muted">Grain</span> one row per <b className="mono">{g.combos[0].join(' + ')}</b>
+          {g.dup_rows > 0 && <span className="warn-text"> except {fmt.n(g.dup_rows)} duplicate rows</span>}
+          {g.on_sample && <span className="muted"> (sample)</span>}
+        </span>
+      )}
+      {g && !g.combos?.length && <span><span className="muted">Grain</span> <span className="warn-text">no key within 3 columns</span></span>}
+      {tm && (
+        <span className="hist-inline" title={`${tm.column_name}: ${fmt.n(tm.dated_rows)} dated rows`}>
+          <span className="muted">History</span> <span className="mono">{tm.column_name}</span> {monthLabel(tm.first_month)} – {monthLabel(tm.last_month)}
+          <span className="muted"> · {tm.months_present} months{tm.empty_months ? '' : ' · no gaps'}</span>
+          {tm.empty_months > 0 && <span className="warn-text"> · {tm.empty_months} empty months</span>}
+          {tm.future_rows > 0 && <span className="muted"> · {fmt.n(tm.future_rows)} future</span>}
+          <Sparkline points={pts} width={Math.min(140, Math.max(40, pts.length * 4))} />
+        </span>
+      )}
+      <button className="link" onClick={onOpen}>{ins.dependency_count ? `${ins.dependency_count} dependencies · ` : ''}Insights →</button>
     </div>
   )
 }
 
 /* ------------------------------------------------------------------ sample */
-export function SamplePanel({ t, hl, workshop, n: n0 = 20, only, remote = false, term }) {
+export function SamplePanel({ t, hl, workshop, n: n0 = SAMPLE_SIZES[0], only, remote = false, term }) {
   const key = `sample:${t.schema}.${t.table}`
   const items = t.columns.map((c) => ({ key: c.column, label: c.column, hint: c.type.toLowerCase(), strong: hl.has(c.column) }))
   const [view, setView] = useState(() => {
@@ -256,7 +307,7 @@ export function SamplePanel({ t, hl, workshop, n: n0 = 20, only, remote = false,
     <>
       <div className="subbar">
         <div className="seg">
-          {[10, 20, 50].map((x) => <button key={x} className={n === x ? 'active' : ''} onClick={() => setN(x)}>{x}</button>)}
+          {SAMPLE_SIZES.map((x) => <button key={x} className={n === x ? 'active' : ''} onClick={() => setN(x)}>{x}</button>)}
         </div>
         <button className="btn" onClick={() => setTick((x) => x + 1)} title="Draw another random sample">↻ Resample</button>
         <ColumnPicker items={items} value={view} onChange={setView} presets={[
@@ -341,13 +392,15 @@ function ProfilePanel({ t, onOpenColumn, onReload }) {
 }
 
 /* ------------------------------------------------------------------ relationships */
-function RelPanel({ t, allTables, onOpenTable }) {
+function RelPanel({ t, allTables, onOpenTable, onOpenSql }) {
   const [left, setLeft] = useState(t.columns[0]?.column)
   const [other, setOther] = useState('')
   const [otherCols, setOtherCols] = useState([])
   const [right, setRight] = useState('')
   const [res, setRes] = useState(null)
   const [err, setErr] = useState(null)
+  const [erdOpen, setErdOpen] = useState(false)
+  const [cmp, setCmp] = useState(null)
 
   useEffect(() => {
     if (!other) return
@@ -362,15 +415,26 @@ function RelPanel({ t, allTables, onOpenTable }) {
   const rows = t.relationships.map((r) => ({ ...r, dir: r.from_table === t.table && r.from_schema === t.schema ? 'out' : 'in' }))
   return (
     <>
+      <div className="subbar">
+        <span className="muted small">{rows.length} discovered link{rows.length === 1 ? '' : 's'}</span>
+        <span className="spacer" />
+        <button className="btn" disabled={!rows.length} onClick={() => setErdOpen(true)}
+          title="ER diagram of this table and the tables it links to (1 or 2 hops); untick the ones you don't want">◇ ER diagram</button>
+      </div>
+      {erdOpen && <ErdDialog focus={`${t.schema}.${t.table}`} minConfidence={0.8} onClose={() => setErdOpen(false)} onOpenTable={onOpenTable} />}
+      {cmp && <CompareDialog left={cmp[0]} right={cmp[1]} onClose={() => setCmp(null)} onOpenSql={onOpenSql} />}
       <DataGrid rows={rows} id="tableRels" empty="No relationships discovered for this table (run bearings relate)" columns={[
         { key: 'dir', label: '', render: (r) => r.dir === 'out' ? '→' : '←', width: 30 },
         { key: 'from', label: 'From (FK)', render: (r) => <span className="mono">{r.from_table}.{r.from_column}</span>, value: (r) => r.from_table + r.from_column },
         { key: 'to', label: 'To (key)', render: (r) => (
           <button className="link mono" onClick={() => r.dir === 'out' ? onOpenTable(r.to_schema, r.to_table, r.to_column) : onOpenTable(r.from_schema, r.from_table, r.from_column)}>
             {r.to_table}.{r.to_column}</button>), value: (r) => r.to_table },
+        { key: 'cardinality', label: 'Cardinality', render: (r) => <Card r={r} />, value: (r) => r.cardinality },
         { key: 'overlap_pct', label: 'Overlap', render: (r) => <span className="numbar"><Bar pct={r.overlap_pct} tone="good" width={60} />{fmt.pct(r.overlap_pct)}</span>, align: 'right' },
-        { key: 'name_score', label: 'Name sim.', render: (r) => r.name_score.toFixed(2), align: 'right' },
+        { key: 'orphan_rows', label: 'Orphan rows', render: (r) => r.orphan_rows ? <span className="warn-text">{fmt.n(r.orphan_rows)}</span> : r.orphan_rows === 0 ? '0' : '', value: (r) => r.orphan_rows, align: 'right' },
         { key: 'confidence', label: 'Confidence', render: (r) => r.confidence.toFixed(2), align: 'right' },
+        { key: 'cmp', label: '', render: (r) => r.cardinality ? <button className="link small" title="Compare the attributes of the linked records"
+            onClick={(e) => { e.stopPropagation(); setCmp([`${r.from_schema}.${r.from_table}.${r.from_column}`, `${r.to_schema}.${r.to_table}.${r.to_column}`]) }}>⇄ compare</button> : '' },
       ]} />
       <div className="card">
         <h4>Check a join manually</h4>
@@ -390,9 +454,22 @@ function RelPanel({ t, allTables, onOpenTable }) {
             <div><b>{fmt.pct(res.left_in_right_pct)}</b> of {fmt.n(res.left_distinct)} distinct <span className="mono">{left}</span> values exist in <span className="mono">{right}</span></div>
             <div><b>{fmt.pct(res.right_in_left_pct)}</b> of {fmt.n(res.right_distinct)} distinct <span className="mono">{right}</span> values exist in <span className="mono">{left}</span></div>
             {res.left_orphans.length > 0 && <div className="muted small">Orphans (in {left}, not in {right}): <span className="mono">{res.left_orphans.join(', ')}</span></div>}
+            {res.cardinality && <div><Card r={res} /> {res.summary} <button className="link small" onClick={() => setCmp([`${t.schema}.${t.table}.${left}`, `${other}.${right}`])}>⇄ compare attributes</button></div>}
           </div>
         )}
       </div>
     </>
+  )
+}
+
+/** Cardinality chip: 1:N · optional, with the plain-language sentence as tooltip. */
+export function Card({ r }) {
+  if (!r?.cardinality) return <span className="muted small" title="Not measured: needs the rows of both tables (local or cached)">—</span>
+  const opt = (r.fk_null_pct || 0) > 0
+  return (
+    <span className="card-chip" title={r.summary || ''}>
+      <span className={`chip ${r.cardinality === 'N:M' ? 'warn' : 'accent'}`}>{r.cardinality}</span>
+      <span className="muted small"> {opt ? 'optional' : 'mandatory'}{r.card_on_sample ? ' · sample' : ''}</span>
+    </span>
   )
 }

@@ -27,3 +27,6 @@ web/node_modules/
 .bearings/
 build/
 dist/
+
+# screenshots saved by the Claude desktop app
+Claude outputs/

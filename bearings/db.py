@@ -81,6 +81,51 @@ CREATE TABLE IF NOT EXISTS {META}.settings (key VARCHAR PRIMARY KEY, value VARCH
 CREATE TABLE IF NOT EXISTS {META}.key_values (
   schema_name VARCHAR, table_name VARCHAR, column_name VARCHAR, v VARCHAR
 );
+-- v0.4 modelling insights: disguised nulls / type hints (profile), cardinality (relationships), grain,
+-- time coverage and dependencies (bearings insights)
+ALTER TABLE {META}.column_profile ADD COLUMN IF NOT EXISTS placeholder_count BIGINT;
+ALTER TABLE {META}.column_profile ADD COLUMN IF NOT EXISTS placeholder_values VARCHAR;
+ALTER TABLE {META}.column_profile ADD COLUMN IF NOT EXISTS effective_null_pct DOUBLE;
+ALTER TABLE {META}.column_profile ADD COLUMN IF NOT EXISTS type_hint VARCHAR;
+ALTER TABLE {META}.column_profile ADD COLUMN IF NOT EXISTS leading_zero_count BIGINT;
+ALTER TABLE {META}.relationships ADD COLUMN IF NOT EXISTS cardinality VARCHAR;
+ALTER TABLE {META}.relationships ADD COLUMN IF NOT EXISTS child_avg DOUBLE;
+ALTER TABLE {META}.relationships ADD COLUMN IF NOT EXISTS child_max BIGINT;
+ALTER TABLE {META}.relationships ADD COLUMN IF NOT EXISTS parent_no_child_pct DOUBLE;
+ALTER TABLE {META}.relationships ADD COLUMN IF NOT EXISTS fk_null_pct DOUBLE;
+ALTER TABLE {META}.relationships ADD COLUMN IF NOT EXISTS orphan_rows BIGINT;
+ALTER TABLE {META}.relationships ADD COLUMN IF NOT EXISTS card_on_sample BOOLEAN;
+ALTER TABLE {META}.table_profile ADD COLUMN IF NOT EXISTS grain VARCHAR;
+ALTER TABLE {META}.table_profile ADD COLUMN IF NOT EXISTS grain_dup_rows BIGINT;
+ALTER TABLE {META}.table_profile ADD COLUMN IF NOT EXISTS grain_on_sample BOOLEAN;
+ALTER TABLE {META}.table_profile ADD COLUMN IF NOT EXISTS insights_at TIMESTAMP;
+ALTER TABLE {META}.column_profile ADD COLUMN IF NOT EXISTS outlier_count BIGINT;
+ALTER TABLE {META}.column_profile ADD COLUMN IF NOT EXISTS outlier_low DOUBLE;
+ALTER TABLE {META}.column_profile ADD COLUMN IF NOT EXISTS outlier_high DOUBLE;
+ALTER TABLE {META}.column_profile ADD COLUMN IF NOT EXISTS outlier_values VARCHAR;
+ALTER TABLE {META}.column_profile ADD COLUMN IF NOT EXISTS negative_count BIGINT;
+CREATE TABLE IF NOT EXISTS {META}.code_values (
+  schema_name VARCHAR, table_name VARCHAR, column_name VARCHAR, value VARCHAR, n BIGINT, on_sample BOOLEAN
+);
+CREATE TABLE IF NOT EXISTS {META}.conditional_fill (
+  schema_name VARCHAR, table_name VARCHAR, column_name VARCHAR, by_column VARCHAR, when_values VARCHAR,
+  precision DOUBLE, coverage DOUBLE, filled_rows BIGINT, rows_when BIGINT, found_at TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS {META}.optional_groups (
+  schema_name VARCHAR, table_name VARCHAR, columns VARCHAR, filled_rows BIGINT, row_count BIGINT, similarity DOUBLE,
+  found_at TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS {META}.time_profile (
+  schema_name VARCHAR, table_name VARCHAR, column_name VARCHAR, parsed_from_text BOOLEAN,
+  first_month DATE, last_month DATE, months_present INTEGER, empty_months INTEGER,
+  future_rows BIGINT, sentinel_rows BIGINT, dated_rows BIGINT, kind VARCHAR, is_primary BOOLEAN,
+  series VARCHAR, on_sample BOOLEAN, profiled_at TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS {META}.dependencies (
+  schema_name VARCHAR, table_name VARCHAR, determinant VARCHAR, dependent VARCHAR,
+  strength DOUBLE, exceptions BIGINT, rows_checked BIGINT, determinant_distinct BIGINT, kind VARCHAR,
+  on_sample BOOLEAN, found_at TIMESTAMP
+);
 """
 
 
@@ -187,6 +232,10 @@ CREATE TABLE IF NOT EXISTS annotations (
   notes TEXT DEFAULT '', updated_at TEXT,
   PRIMARY KEY (schema_name, table_name, column_name)
 );
+CREATE TABLE IF NOT EXISTS dismissed_insights (
+  schema_name TEXT NOT NULL, table_name TEXT NOT NULL, kind TEXT NOT NULL, item TEXT NOT NULL, dismissed_at TEXT,
+  PRIMARY KEY (schema_name, table_name, kind, item)
+);
 """
 
 
@@ -195,11 +244,15 @@ def ann_connect(db_path: Path) -> sqlite3.Connection:
     p.parent.mkdir(parents=True, exist_ok=True)
     c = sqlite3.connect(str(p))
     c.row_factory = sqlite3.Row
-    c.execute(ANN_DDL)
+    c.executescript(ANN_DDL)
     return c
 
 
 # ---------- clean-up ----------
+
+def _insight_tables(con) -> tuple[str, ...]:
+    return tuple(m for m in ("time_profile", "dependencies", "code_values", "conditional_fill", "optional_groups") if has_meta(con, m))
+
 
 def drop_table(con, schema: str, table: str) -> None:
     if has_meta(con, "remote_tables") and con.execute(
@@ -211,7 +264,7 @@ def drop_table(con, schema: str, table: str) -> None:
         con.execute(f"DELETE FROM {META}.remote_cache WHERE alias=? AND table_name=?", [schema, table])
         return
     con.execute(f"DROP TABLE IF EXISTS {fq(schema, table)}")
-    for m in ("load_log", "comments", "table_profile", "column_profile") + (("key_fingerprint", "key_values") if has_meta(con, "key_values") else ()):
+    for m in ("load_log", "comments", "table_profile", "column_profile") + _insight_tables(con) + (("key_fingerprint", "key_values") if has_meta(con, "key_values") else ()):
         con.execute(f"DELETE FROM {META}.{m} WHERE schema_name=? AND table_name=?", [schema, table])
     con.execute(f"DELETE FROM {META}.relationships WHERE (from_schema=? AND from_table=?) OR (to_schema=? AND to_table=?)",
                 [schema, table, schema, table])
@@ -226,7 +279,7 @@ def drop_schema(con, schema: str) -> int:
             con.execute(f"DROP TABLE IF EXISTS {fq('main', t)}")
     else:
         con.execute(f"DROP SCHEMA IF EXISTS {qi(schema)} CASCADE")
-    for m in ("load_log", "comments", "table_profile", "column_profile") + (("key_fingerprint", "key_values") if has_meta(con, "key_values") else ()):
+    for m in ("load_log", "comments", "table_profile", "column_profile") + _insight_tables(con) + (("key_fingerprint", "key_values") if has_meta(con, "key_values") else ()):
         con.execute(f"DELETE FROM {META}.{m} WHERE schema_name=?", [schema])
     con.execute(f"DELETE FROM {META}.relationships WHERE from_schema=? OR to_schema=?", [schema, schema])
     if schema in remote_aliases(con):  # an attached Databricks schema: forget its cached metadata too

@@ -19,7 +19,8 @@ def test_demo_end_to_end(tmp_path, monkeypatch):
     c = TestClient(api.app)
 
     st = c.get("/api/stats").json()
-    assert st["tables"] == 8 and set(st["schemas"]) == {"pms", "crm"}
+    assert st["tables"] == 9 and set(st["schemas"]) == {"pms", "crm", "dwh"}
+    assert st["version"]
 
     # exact vs fuzzy name matching
     exact = c.get("/api/search", params={"q": "reservationid", "match": "exact", "columns_only": True}).json()

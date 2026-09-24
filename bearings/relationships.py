@@ -6,10 +6,11 @@ from datetime import datetime
 
 from rapidfuzz import fuzz
 
-from .db import META, fq, has_meta, qi, user_tables
+from .db import META, fq, has_meta, has_meta_column, qi, user_tables
 from .profiler import family
 
 ID_SUFFIX = re.compile(r"(_?(id|key|code|no|num|nbr|number|cd|ref))$", re.I)
+MEASURE = re.compile(r"^(FLOAT|DOUBLE|REAL|DECIMAL|NUMERIC)", re.I)
 
 
 def norm(s: str) -> str:
@@ -72,6 +73,66 @@ def overlap(con, fs, ft, fc, ts, tt, tc, local: set | None = None) -> tuple[int,
     return int(a or 0), int(m or 0)
 
 
+CARD_KEYS = ["cardinality", "child_avg", "child_max", "parent_no_child_pct", "fk_null_pct", "orphan_rows", "card_on_sample"]
+
+
+def sampled_tables(con) -> set[tuple[str, str]]:
+    """Local copies of remote tables that hold only a sample of the rows."""
+    if not has_meta(con, "remote_cache"):
+        return set()
+    return {(a, t) for a, t in con.execute(f"SELECT alias, table_name FROM {META}.remote_cache WHERE NOT complete").fetchall()}
+
+
+def cardinality(con, fs, ft, fc, ts, tt, tc, local: set | None = None, sampled: set | None = None) -> dict:
+    """How a FK → key link behaves: 1:1 / 1:N / N:M, children per parent, parents without children, FK nulls and
+    orphan rows. Needs the rows of both tables (local or cached); returns {} otherwise."""
+    if local is None:
+        local = set(user_tables(con))
+    if (fs, ft) not in local or (ts, tt) not in local:
+        return {}
+    child, parent, fk, pk = fq(fs, ft), fq(ts, tt), qi(fc), qi(tc)
+    parent_max, child_max, child_avg, no_child, fk_null, orphans = con.execute(f"""
+        WITH ch AS (SELECT CAST({fk} AS VARCHAR) k, count(*) n FROM {child} WHERE {fk} IS NOT NULL GROUP BY 1),
+             pa AS (SELECT CAST({pk} AS VARCHAR) k, count(*) n FROM {parent} WHERE {pk} IS NOT NULL GROUP BY 1)
+        SELECT (SELECT max(n) FROM pa),
+               (SELECT max(ch.n) FROM ch SEMI JOIN pa USING (k)),
+               (SELECT avg(ch.n) FROM ch SEMI JOIN pa USING (k)),
+               (SELECT 100.0 * count(*) FILTER (WHERE ch.k IS NULL) / nullif(count(*), 0) FROM pa LEFT JOIN ch USING (k)),
+               (SELECT 100.0 * count(*) FILTER (WHERE {fk} IS NULL) / nullif(count(*), 0) FROM {child}),
+               (SELECT coalesce(sum(ch.n), 0) FROM ch ANTI JOIN pa USING (k))""").fetchone()
+    if (parent_max or 0) > 1:
+        card = "N:M"
+    elif (child_max or 0) <= 1:
+        card = "1:1"
+    else:
+        card = "1:N"
+    sampled = sampled if sampled is not None else sampled_tables(con)
+    return {"cardinality": card, "child_avg": round(float(child_avg), 2) if child_avg is not None else None,
+            "child_max": int(child_max or 0), "parent_no_child_pct": round(float(no_child or 0), 2),
+            "fk_null_pct": round(float(fk_null or 0), 2), "orphan_rows": int(orphans or 0),
+            "card_on_sample": (fs, ft) in sampled or (ts, tt) in sampled}
+
+
+def describe(r: dict) -> str:
+    """One plain-language sentence for a relationship with cardinality, e.g. for workshop screens and exports."""
+    if not r.get("cardinality"):
+        return ""
+    ch, pa = r["from_table"], r["to_table"]
+    if r["cardinality"] == "N:M":
+        s = f"{pa}.{r['to_column']} is not unique, so this is many-to-many (or the wrong target column)"
+    else:
+        lo = "0" if (r.get("parent_no_child_pct") or 0) > 0 else "1"
+        if r["cardinality"] == "1:1":
+            s = f"each {pa} has {'at most one' if lo == '0' else 'exactly one'} {ch}"
+        else:
+            avg = f" ({r['child_avg']:g} on average)" if r.get("child_avg") is not None else ""
+            s = f"each {pa} has {lo}–{r.get('child_max'):,} {ch}{avg}"
+    opt = (f"{r['fk_null_pct']:g}% of {ch} rows have no {r['from_column']} (optional)" if (r.get("fk_null_pct") or 0) > 0
+           else f"{r['from_column']} is always filled (mandatory)")
+    orph = f"; {r['orphan_rows']:,} {ch} rows point to a {pa} that doesn't exist" if r.get("orphan_rows") else ""
+    return f"{s[0].upper()}{s[1:]}; {opt}{orph}."
+
+
 def _compatible(t1: str, t2: str) -> bool:
     f1, f2 = family(t1), family(t2)
     if "other" in (f1, f2) or "bool" in (f1, f2):
@@ -98,6 +159,8 @@ def discover(con, min_overlap: float = 0.5, name_threshold: float = 0.75, deep: 
     for f in cols:
         if not f["dist"] or '"constant"' in (f["flags"] or "") or '"all_null"' in (f["flags"] or ""):
             continue
+        if MEASURE.match(f["type"]) and not ID_SUFFIX.search(f["c"]):
+            continue  # amounts and rates aren't foreign keys, even when a copy of the table shares their values
         for t in targets:
             if (f["s"], f["t"]) == (t["s"], t["t"]):
                 continue
@@ -150,6 +213,14 @@ def discover(con, min_overlap: float = 0.5, name_threshold: float = 0.75, deep: 
     for rs in best.values():
         rs.sort(key=lambda r: -r["confidence"])
         out += [r for r in rs if r["confidence"] >= rs[0]["confidence"] - 0.05]
+    # cardinality and optionality (needs the rows of both tables: local or cached)
+    sampled = sampled_tables(con)
+    for r in out:
+        try:
+            r.update(cardinality(con, r["from_schema"], r["from_table"], r["from_column"],
+                                 r["to_schema"], r["to_table"], r["to_column"], local=local, sampled=sampled))
+        except Exception:
+            pass
     return out
 
 
@@ -166,5 +237,41 @@ def save(con, rels: list[dict], schemas: set[str] | None = None, touching: set[s
         con.execute(f"DELETE FROM {META}.relationships")
     keys = ["from_schema", "from_table", "from_column", "to_schema", "to_table", "to_column",
             "name_score", "overlap_pct", "from_distinct", "matched_distinct", "confidence", "method"]
-    con.executemany(f"INSERT INTO {META}.relationships VALUES ({', '.join('?' * 13)})",
-                    [[r[k] for k in keys] + [now] for r in rels])
+    if has_meta_column(con, "relationships", "cardinality"):
+        keys += CARD_KEYS
+    con.executemany(f"INSERT INTO {META}.relationships ({', '.join(keys)}, found_at) VALUES ({', '.join('?' * (len(keys) + 1))})",
+                    [[r.get(k) for k in keys] + [now] for r in rels])
+
+
+def refresh_cardinality(con, schemas: set[str] | None = None) -> int:
+    """Re-measure cardinality of stored relationships (e.g. after remote tables were cached locally)."""
+    if not has_meta_column(con, "relationships", "cardinality"):
+        return 0
+    rows = con.execute(f"SELECT from_schema, from_table, from_column, to_schema, to_table, to_column FROM {META}.relationships").fetchall()
+    local, sampled, n = set(user_tables(con)), sampled_tables(con), 0
+    for fs, ft, fc, ts, tt, tc in rows:
+        if schemas and not ({fs, ts} & schemas):
+            continue
+        try:
+            c = cardinality(con, fs, ft, fc, ts, tt, tc, local=local, sampled=sampled)
+        except Exception:
+            continue
+        if not c:
+            continue
+        con.execute(f"UPDATE {META}.relationships SET {', '.join(k + '=?' for k in CARD_KEYS)} "
+                    "WHERE from_schema=? AND from_table=? AND from_column=? AND to_schema=? AND to_table=? AND to_column=?",
+                    [c[k] for k in CARD_KEYS] + [fs, ft, fc, ts, tt, tc])
+        n += 1
+    return n
+
+
+def with_targets(con, columns: dict[tuple[str, str], list[str]]) -> list[dict]:
+    """Stored relationships, each with the column names of its target table (for "denormalised copy" notes)."""
+    cur = con.execute(f"SELECT * EXCLUDE (found_at) FROM {META}.relationships")
+    names = [d[0] for d in cur.description]
+    out = []
+    for r in cur.fetchall():
+        d = dict(zip(names, r))
+        d["target_columns"] = columns.get((d["to_schema"], d["to_table"]), [])
+        out.append(d)
+    return out

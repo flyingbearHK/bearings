@@ -17,7 +17,10 @@ When you're dropped into a new data-modelling engagement, the first weeks go int
 - **Two-layer results:** tables on the left, matched columns next to them, and the full schema with the matches highlighted.
 - **Profile at a glance:** null % and distinct counts, top values, value patterns, histograms, and flags for candidate keys, PII, mixed formats and constant columns.
 - **Look up a key across tables:** type `reservationid=9401`, tick the tables, and see every matching row side by side.
-- **Relationship discovery:** likely FK → key links from name similarity plus value overlap, including across source systems.
+- **Relationship discovery:** likely FK → key links from name similarity plus value overlap, including across source systems, with measured **cardinality** (1:1 / 1:N / N:M), optionality and orphan rows, and a **Mermaid ER diagram** export.
+- **Data quality:** outliers and stray negative amounts, **near-duplicate records** (the same customer captured twice), conditional completeness ("company_name is only filled for corporate guests"), and **suggested DQ rules** exported for **Databricks DQX**, **Great Expectations** and **Microsoft Purview**.
+- **Code lists and cross-system comparison:** every low-cardinality column with all its values, compared value by value with the same code in another system (mapping CSV), and a side-by-side **attribute comparison** of linked records ("is the e-mail the same in the CRM and the PMS?").
+- **Modelling insights:** the **grain** of each table ("one row per CustomerId + Channel"), **time coverage** of its date columns (history, gaps, future rows, sentinel dates), and **dependencies between columns** turned into candidate entities, hierarchies and code ↔ description pairs – plus **disguised nulls** (`N/A`, `-`, `1900-01-01`) and **type hints** for text columns.
 - **Annotate and export:** tag columns (PII, key…), map them to CDM entities and attributes, and export an Excel mapping workbook, JSON or Markdown specs.
 - **Schema scope:** load each source system into its own schema and focus the whole app on one or several of them.
 - **Workshop mode:** bigger text, and PII masked in samples, for screen-sharing with a room full of stakeholders.
@@ -53,7 +56,7 @@ To try the tool before real exports arrive, `bearings demo` generates a **fictio
 
 ```bash
 uv sync                                   # first time only
-uv run bearings demo                            # ~3 s: generate → load → comments → profile → relate
+uv run bearings demo                            # ~7 s: generate → load → comments → profile → relate → insights
 uv run bearings serve --db data/demo.duckdb     # open http://127.0.0.1:8765
 ```
 
@@ -61,36 +64,44 @@ uv run bearings serve --db data/demo.duckdb     # open http://127.0.0.1:8765
 |---|---|---|---|---|
 | `pms` | property | 10 | Parquet | Hotel master: code, name, country, currency, rooms (`brand_segment` is always null) |
 | `pms` | room_type | 40 | Parquet | 4 room types per property |
-| `pms` | guest | 8,000 | Parquet | Guest profiles with PII: names, email (nulls and blanks), phone in 3 formats, DOB |
-| `pms` | reservation | 30,000 | Parquet **folder of 3 part-files** | Stays: dates, status, channel, segment, rate plan, revenue |
-| `pms` | folio_charge | 90,000 | CSV | Charges; `resv_ref` is a legacy FK with orphans; `posting_date_txt` has mixed date formats |
-| `crm` | customer | ~7,300 | CSV | CamelCase naming, text IDs, `PmsGuestCode` cross-reference, **duplicate customers** |
+| `pms` | guest | 8,000 | Parquet | Guest profiles with PII: names, email (nulls and blanks), phone in 3 formats, DOB; corporate guests (`guest_type`) with `company_name` / `company_tax_id` – a subtype |
+| `pms` | reservation | 30,000 | Parquet **folder of 3 part-files** | Stays: dates, status, channel, segment, rate plan, revenue (room type implies the hotel) |
+| `pms` | folio_charge | 90,000 | CSV | Charges; `resv_ref` is a legacy FK with orphans; `posting_date_txt` has mixed date formats; `amount` has refunds (negative) and a few amounts keyed without the decimal point |
+| `crm` | customer | ~7,300 | CSV | CamelCase naming, text IDs, `PmsGuestCode` cross-reference, **duplicate customers** (the same guest captured again: upper-case or misspelt surname, missing e-mail, birth date in another format) |
 | `crm` | loyalty_account | ~5,100 | CSV | Tier and points per customer |
-| `crm` | marketing_consent | ~17,400 | CSV | Opt-in per channel (`CaptureSource` is constant) |
+| `crm` | marketing_consent | ~17,400 | CSV | Opt-in per channel (`CaptureSource` is constant; no single-column key) |
+| `dwh` | stay_flat | 30,000 | CSV | A **flattened reporting extract**: one row per stay with hotel, region, brand and room-type attributes repeated; ~1 % misspelt hotel names, placeholder company names (`N/A`, `-`, `UNKNOWN`), `cancel_date` = `1900-01-01` when not cancelled |
 
 Options: `--scale 5` makes about 5× more rows (useful for testing performance). `--files-only` writes only the export files, so you can practise the real `bearings load` / `bearings profile` / `bearings relate` steps yourself:
 
 ```bash
-uv run bearings demo --files-only                       # → demo/exports/pms, demo/exports/crm, demo/comments.csv
+uv run bearings demo --files-only                       # → demo/exports/pms, demo/exports/crm, demo/exports/dwh, demo/comments.csv
 uv run bearings load demo/exports/pms --schema pms --db data/play.duckdb
 uv run bearings load demo/exports/crm --schema crm --db data/play.duckdb
+uv run bearings load demo/exports/dwh --schema dwh --db data/play.duckdb
 uv run bearings comments demo/comments.csv --db data/play.duckdb
 uv run bearings profile --db data/play.duckdb
 uv run bearings relate --deep --db data/play.duckdb
+uv run bearings insights --show --db data/play.duckdb
 uv run bearings serve --db data/play.duckdb
 ```
 
 ### Things to try in the demo
 
 1. **Fuzzy name search.** Try `guest`. The table matches, and so do `reservation.guest_id`, `crm.customer.PmsGuestCode` (a different naming style) and `reservation.confirmation_no`, which matches through its comment. Then try `email`, `revenue`, `*_code` and `confirmation number`, which is found through the column comment.
-2. **Two-layer results.** Click `PmsGuestCode` in the column list to open the `customer` schema with that row highlighted. Click **Sample 20**, then use **Columns → Matched first** to reorder the sample.
-3. **Profiling.** Use the ▤ button on `pms.guest`. `mobile_phone` shows *mixed fmt* (three formats), `email_address` shows *PII email* and *blanks*, and `vip_flag` has an uneven true/false split. Also look at `folio_charge.posting_date_txt` (mixed date formats) and `property.brand_segment` (*all null*).
+2. **Two-layer results.** Click `PmsGuestCode` in the column list to open the `customer` schema with that row highlighted. Click **Sample 30**, then use **Columns → Matched first** to reorder the sample.
+3. **Profiling.** Use the ▤ button on `pms.guest`. `mobile_phone` shows *mixed fmt* (three formats), `email_address` shows *PII email* and *blanks*, and `vip_flag` has an uneven true/false split. Also look at `folio_charge.posting_date_txt` (*type hint*: a DATE stored as text, in two formats) and `property.brand_segment` (*all null*). In `dwh.stay_flat`, `company_name` is 20 % null but **70 % effectively empty** (*placeholders*: `N/A`, `-`, `UNKNOWN`), and `cancel_date` is 91 % `1900-01-01`.
 4. **Value search.** Switch to *Value* and search `G00000042` (exact). It turns up in both `pms.guest.guest_code` and `crm.customer.PmsGuestCode`, which is how you'd find cross-system keys. Clicking any top value in a profile drawer searches for that value everywhere.
-5. **Relationships tab.** Includes the cross-system link `crm.customer.PmsGuestCode → pms.guest.guest_code`, and `folio_charge.resv_ref → reservation.reservation_id`, found by value overlap even though the names don't match. It also shows a coincidental match, `guest.nationality_code → property.country_code`, which is a good reminder to review what the discovery suggests. Use **Check a join manually** to see orphan `resv_ref` values.
+5. **Relationships tab.** Includes the cross-system link `crm.customer.PmsGuestCode → pms.guest.guest_code`, and `folio_charge.resv_ref → reservation.reservation_id`, found by value overlap even though the names don't match. It also shows a coincidental match, `guest.nationality_code → property.country_code` (1,600 orphan rows), which is a good reminder to review what the discovery suggests. The **Cardinality** column says how each link behaves: `loyalty_account → customer` is an optional **1:1** extension (30 % of customers have none), `PmsGuestCode → guest` allows up to **2** customers per guest (the CRM duplicates). Filter to `reservation` and click **◇ ER diagram**: untick the entities you don't want and the diagram redraws; download it as `.mmd` (Mermaid) or `.svg`. From a table, **Relationships → ◇ ER diagram** draws that table with its direct links (or 2 hops). Use **Check a join manually** to see orphan `resv_ref` values.
 6. **Key check.** In `crm.customer`, tick `PmsGuestCode` and click **Check key**. It's not unique, because the CRM has duplicate customers, and the check shows example duplicates. In `pms.reservation`, tick `guest_id` + `arrival_date`.
 7. **Annotate.** Open `crm.customer.EmailAddr`, tag it `PII, contact`, and set CDM `Party` / `EmailAddress`. Do the same for `pms.guest.email_address`. Search `Party` to find both, then **⤓ Excel** exports the mapping workbook.
 8. **Workshop mode.** Tick it in the header. The text gets bigger and PII columns are masked in samples.
-9. **SQL tab.** Try `SUMMARIZE pms.reservation`, or:
+9. **Insights.** Open `dwh.stay_flat` and its **Insights** tab (or <kbd>5</kbd>). The header already says *one row per stay_id* and *History arrival_date Jan 2025 – Oct 2026*. The tab finds the **Property** entity (`property_code = country_code = property_name = local_currency` → `region_name`, `brand_name`), the hierarchies **Room type → Property → Region / Brand**, a **redundant FK** (the room type already implies the hotel) and the misspelt hotel names (*property_name depends on property_code for 99 % of rows* → **show exception rows**). **Map to CDM entity** writes the mapping to all those columns. Also try `crm.marketing_consent` (grain **CustomerId + Channel**) and `pms.folio_charge` (`charge_type = gl_account`: a code list mapped 1:1 to GL accounts).
+10. **Subtypes.** In `pms.guest` → **Insights**, *Optional attributes and subtypes* says `company_name, company_tax_id` are filled together only when `guest_type = CORPORATE` – a possible *Corporate guest* subtype (**by guest_type** shows the breakdown). In `dwh.stay_flat`, `cancel_date` is only filled when `status_code = CXL`.
+11. **Quality.** `crm.customer` → **Quality** → **Find duplicates**: 71 pairs such as *Rossi* / *Rossie* with the same birth date written two ways. `pms.folio_charge` → **Quality** shows the refunds and the amounts keyed without a decimal point, and the **suggested data-quality rules** (untick what doesn't apply, then **⤓ DQX .yml**, **⤓ GX .json**, **⤓ Purview .csv** or all as a .zip; for every table: **Annotations → ⤓ DQ rules** or `bearings dq-rules`).
+12. **Code lists.** The **Code lists** tab lists every low-cardinality column. Pick `crm.customer.CountryOfResidence`: it's compared with `pms.guest.nationality_code` automatically (100 % shared values); `pms.reservation.status_code` vs `dwh.stay_flat.status_code` gives a value mapping to download.
+13. **Compare attributes.** Relationships → filter `PmsGuestCode` → **⇄ compare**: first names and countries agree, birth dates agree once the format is normalised, surnames differ in 23 rows (click the pair for them), and each system has e-mails the other lacks.
+14. **SQL tab.** Try `SUMMARIZE pms.reservation`, or:
    ```sql
    SELECT c.CustomerId, g.guest_code, g.email_address, c.EmailAddr
    FROM crm.customer c JOIN pms.guest g ON g.guest_code = c.PmsGuestCode
@@ -116,15 +127,22 @@ uv run bearings profile                                    # all tables
 uv run bearings profile -t pms.reservation --sample-rows 2000000   # big table: profile a random sample
 uv run bearings profile --only-new                         # only tables that aren't profiled yet
 
-# 4. Relationship discovery (name similarity + value overlap)
+# 4. Relationship discovery (name similarity + value overlap; cardinality measured on the rows)
 uv run bearings relate                                     # --deep also tests *_id/_code/_ref columns whose names don't match
 
-# 5. Run the app
+# 5. Modelling insights: grain, time coverage, dependencies → candidate entities and hierarchies
+uv run bearings insights                                   # --show prints the entities; -t / -s to narrow; --only grain,time,deps,codes,optional
+
+# 6. Data-quality rules for DQX / Great Expectations / Purview (from the profile, insights and relationships)
+uv run bearings dq-rules -o dq_rules.zip                   # or .yml (DQX), .json (GX), .csv (Purview); -s / -t, --errors-only
+
+# 7. Run the app
 uv run bearings serve                                      # http://127.0.0.1:8765
 
 # Other commands
 uv run bearings info                                       # tables, row counts, profile status (-s pms to filter)
-uv run bearings report -o catalog.xlsx                     # Tables / Columns (+profile, tags, CDM) / Relationships (-s pms to filter)
+uv run bearings report -o catalog.xlsx                     # Tables / Columns (+profile, tags, CDM) / Relationships / Grain & history / Candidate entities / Dependencies (-s pms to filter)
+uv run bearings duplicates crm.customer                    # near-duplicate records (-c email=EmailAddr to choose columns)
 uv run bearings drop pms.folio_charge                      # remove one table (or a whole schema: bearings drop pms)
 uv run bearings reset                                      # start fresh – see "Resetting the database" below
 ```
@@ -215,7 +233,7 @@ To reload a system from scratch:
 
 ```bash
 uv run bearings reset -s pms -y
-uv run bearings load ./exports/opera --schema pms && uv run bearings profile -s pms && uv run bearings relate -s pms
+uv run bearings load ./exports/opera --schema pms && uv run bearings profile -s pms && uv run bearings relate -s pms && uv run bearings insights -s pms
 ```
 
 The manual way: stop the server and delete the files. `rm data/bearings.duckdb data/bearings.duckdb.wal` wipes the data; also delete `data/bearings.annotations.sqlite` to lose the annotations. `rm -rf demo/ data/demo.*` removes the demo.
@@ -280,6 +298,7 @@ uv run bearings detach opera                                 # forget the cached
 - **⚡ Remote on demand.** Tick **⚡ Remote** on a table (sample, key check), next to **Show rows** (lookup), or use **⚡ Search N remote tables live** after a value search, to run that query on the whole table on Databricks. In the SQL tab, the engine picker does the same (*Local* queries the cache, including `dev_raw_pms.reservation`).
 - **Live queries (⚡).** On a remote table, **Sample**, **Check key** and **Show rows** (multi-table lookup, e.g. `reservationid=9401` across local and remote tables) run live on the SQL warehouse. Value search first uses the cached key values; **⚡ Search N remote tables live** scans the remote tables in scope (one query per table). The **SQL** tab has an engine picker: *Local (DuckDB)* or *⚡ Databricks · <connection>*, where aliases such as `dev_raw_pms.reservation` expand to the real `catalog`.`schema`.`table`. Live queries are read-only, capped at 1,000 rows, and time out after 120 s (`BEARINGS_REMOTE_TIMEOUT`); up to 3 warehouse sessions are kept open (`BEARINGS_REMOTE_POOL`), and `cache` / `profile` work on 3 tables at a time over them.
 - **Speed.** A live query goes to the warehouse and back (East US ↔ Hong Kong is a few hundred ms before any work), and a serverless warehouse that has been idle needs ~15–20 s to wake up. So: `serve` wakes the warehouse in the background when remote schemas are attached (`BEARINGS_REMOTE_WARM=0` to turn off) and the table header shows its state; samples use `TABLESAMPLE` instead of sorting the table; a lookup is one query; live value search runs 3 tables at a time; identical lookups / key checks / value searches are reused for 10 minutes (`BEARINGS_REMOTE_CACHE_TTL`). For everything else, the local cache is the answer (**⤓ Cache locally** / **↻ Re-cache** on a table, or `bearings cache`); on workshop days also ask the workspace admin for a 20–30 min auto-stop on the warehouse.
+- **Modelling insights on remote tables** (grain, time coverage, dependencies, relationship cardinality) run on the **local cache** – on the cached sample for big tables, and say so. `connect` and `refresh` compute them after caching; a table that isn't cached shows how to cache it first. Nothing extra runs on the warehouse.
 - **Pull when you need everything locally.** `bearings pull` copies a table (or a sample) into DuckDB: joins with local tables, the local profiler and offline work. A pulled copy replaces the metadata-only entry and keeps a link to its source; if the source changes, its profile is marked stale.
 - **Security.** Connection profiles live in `~/.bearings/connections.toml` and hold no secrets. Every query runs as you through Unity Catalog, so your permissions, row filters and column masks apply. Profiling sends only aggregates and a bounded sample over the wire, and the sample is discarded after profiling. Live query results are shown, not stored. Design notes: `docs/design/remote-databricks.md`.
 
@@ -306,11 +325,15 @@ SELECT table_schema, table_name, '' AS column_name, comment FROM cat.information
 | **Filter lookup across tables** | Type `column op value`, e.g. `reservationid=9401`, `guest_code=G1,G2` (a list), `arrival_date>=2026-01-01`, `status_code!=CXL` or `email~gmail` (contains). The left panes show only tables that have a matching column; the Exact/Contains/Fuzzy control decides how the column name is matched. Tick tables, or use the header box to **select all**, then click **Show rows** or press Enter. The right panel lists the matching rows from every selected table, one collapsible section each, with the filter column first, row counts, and **Open table** / **SQL** / **CSV** buttons. Also works after a *Value* search: tick tables and **Show rows** returns the full rows that contain the value. |
 | **Two-layer results** | If only table names match, you get the table list. If columns match, tables are on the left and the matched columns (grouped by table) are on the right. |
 | **Schema view** | Click a column or table to open the full schema. Matched columns are highlighted. **Fields** chooses and reorders the stats shown (null %, distinct, min/max, flags, tags, CDM, comment). |
-| **Sample data** | **Sample 10/20/50** draws random rows. **Columns** lets you choose and drag-reorder columns (remembered per table). Presets: *Matched only* and *Matched first*. You can also require non-null values in the matched columns or add a SQL filter. |
+| **Sample data** | **Sample 30 / 200** draws random rows. **Columns** lets you choose and drag-reorder columns (remembered per table). Presets: *Matched only* and *Matched first*. You can also require non-null values in the matched columns or add a SQL filter. |
 | **Profile** | The **▤** button on any table or column. The table view shows tiles plus null and distinct bars. The column drawer shows stats, histogram, top values (click one to search for it everywhere), patterns and flags. Unprofiled tables can be computed live (the result isn't saved). |
 | **Value search** | Switch to *Value* and press Enter to find which columns contain a code or ID. |
 | **Key check** | Tick columns in the schema and click **Check key** to test whether that combination is unique and see example duplicates. |
-| **Relationships** | Discovered FK → key pairs with overlap % and confidence. There's also a manual overlap checker between any two columns that lists orphan values. |
+| **Relationships** | Discovered FK → key pairs with overlap % and confidence, and how each link behaves: **cardinality** (1:1, 1:N, N:M), mandatory or optional, children per parent, parents without children and orphan rows (measured on local or cached rows; hover for a plain-language sentence). **◇ ER diagram** draws the relationships shown (filter first) in the app: tick or untick the entities to include, change the minimum confidence, choose **Tidy (ELK)** – a layered layout whose lines go around the boxes – or **Classic**, top-down **↓** or left-to-right **→**, zoom / fit, and download **.mmd** (Mermaid source, layout included), **.svg**, or **draw.io** – an editable diagram in the same layout where you can move boxes and the connectors follow (diagrams.net, VS Code, Confluence). In a table's **Relationships** tab, **◇ ER diagram** starts from that table and its direct links, or 2 hops out, with the same checkboxes. Crow's-foot ends come from the measured cardinality; tables without a single-column key show their grain as the key. Diagrams are drawn locally (Mermaid is bundled; nothing is sent anywhere). There's also a manual overlap checker between any two columns that lists orphan values and the cardinality. |
+| **Insights** | The header of every analysed table shows its **grain** and **history** (primary date column, months, gaps, future rows, sparkline). The **Insights** tab adds: the grain with **Check key** / **Tag as key**; **time coverage** of every date column (text dates too), labelled *event date*, *load / change stamp* or *attribute*; **candidate entities** – columns that always go together (X → Y holding for ≥ 98 % of rows), merged when they're the same thing spelt twice (code = description) – with **Map to CDM entity** and **hide**; **hierarchies** (room type → hotel → region); **optional attributes and subtypes** – columns filled only for some kinds of rows (`company_name` only when `guest_type = CORPORATE`), with a breakdown per value; the table's **code lists**; and **data-quality and model notes**: dependencies with exceptions (**show exception rows**, **Open in SQL**), redundant foreign keys and columns copied from another table. Computed by `bearings insights` (also after **Add data**, `demo`, `connect` and `refresh`) or **↻ Re-run**; big tables are sampled (1 M rows). |
+| **Code lists** | Every column with 2–200 values (status, channel, country, tier…) with all its values and counts. Pick one to see the lists that share its values (the same code in another system) and a value-by-value comparison: in both, case/spacing differs, only on one side, with a fuzzy suggestion for unmatched values. **⤓ mapping CSV** is a start for the value mapping. |
+| **Quality** | Per table: **outliers** (beyond 3 × IQR) and stray **negative** amounts; **possible duplicates** – rows sharing an e-mail, phone, name or birth date + surname start, scored exactly (e-mail, phone, dates in any format) and with Jaro-Winkler (names); pick the columns per role and the minimum similarity; and **suggested data-quality rules** (not null, allowed values, format, valid date, not negative, range, not in the future, unique / grain, exists in parent, filled when…) with how many rows pass today – untick, then export for **DQX**, **Great Expectations** or **Purview**. |
+| **Compare attributes** | **⇄ compare** on a relationship: joins the linked records and pairs up the columns that hold the same thing (by name and by agreeing values), with % agreeing after normalising case, spaces, date formats and placeholders, rows that differ, and values only one side has. Click a pair for the rows that differ; add pairs by hand. |
 | **Annotations** | Tags (PII, key, …), CDM entity and attribute, and notes on any column. Annotations are searchable and export to **Excel** or JSON, and **Export .md** gives a per-table spec. |
 | **SQL** | A read-only DuckDB console. Try `SUMMARIZE pms.guest`. Ctrl/⌘+Enter runs the query. |
 | **Schema scope** | The **Schema** dropdown in the header limits the whole app to one or more source systems. See "Several source systems" above. |
@@ -320,9 +343,9 @@ SELECT table_schema, table_name, '' AS column_name, comment FROM cat.information
 | **Grids** | Every grid: click a header to sort (remembered per grid), **Filter rows…** to narrow and highlight, **hide N empty columns** in samples / lookups / SQL results, double-click a cell to copy it. The schema grid can put **matched columns first**, **hide all-null columns**, and **copy names** of all columns. The table list can be sorted by best match, name, rows, columns or schema. |
 | **Highlights** | The search term is marked inside table and column names, comments and sample / lookup cells. |
 
-Keyboard: <kbd>⌘/Ctrl K</kbd> jump · <kbd>/</kbd> search · <kbd>↓</kbd>/<kbd>↑</kbd> next/previous table (works from the search box) · <kbd>⇧↓</kbd>/<kbd>⇧↑</kbd> next/previous matched column · <kbd>x</kbd> tick the table for **Show rows** · <kbd>1</kbd>–<kbd>4</kbd> Schema / Sample / Profile / Relationships · <kbd>s</kbd> sample · <kbd>a</kbd> add data · <kbd>Esc</kbd> clear · <kbd>?</kbd> all shortcuts.
+Keyboard: <kbd>⌘/Ctrl K</kbd> jump · <kbd>/</kbd> search · <kbd>↓</kbd>/<kbd>↑</kbd> next/previous table (works from the search box) · <kbd>⇧↓</kbd>/<kbd>⇧↑</kbd> next/previous matched column · <kbd>x</kbd> tick the table for **Show rows** · <kbd>1</kbd>–<kbd>6</kbd> Schema / Sample / Profile / Relationships / Insights / Quality · <kbd>s</kbd> sample · <kbd>a</kbd> add data · <kbd>Esc</kbd> clear · <kbd>?</kbd> all shortcuts.
 
-Profile flags: `PK?` (unique and not null), `unique*` (unique but has nulls), `≥50% null`, `all null`, `constant`, `mixed fmt`, `blanks`, `PII email/phone`, `PII?` (the column name suggests personal data).
+Profile flags: `PK?` (unique and not null), `unique*` (unique but has nulls), `≥50% null`, `all null`, `constant`, `mixed fmt`, `blanks`, `placeholders` (values that mean "no value": `N/A`, `-`, `UNKNOWN`, `1900-01-01`, `0` / `-1` in a key column – the schema shows the **effective null %**), `type hint` (text that parses as a number, boolean or date – the profile lists the date formats found), `leading zeros` (numeric-looking codes to keep as text), `outliers` (far-out values beyond 3 × IQR), `negatives` (a few negative values in a mostly positive column), `PII email/phone`, `PII?` (the column name suggests personal data).
 
 ## Developing the UI (React + Vite)
 
@@ -341,7 +364,12 @@ bearings/
   loaders/          file readers: CSV/TSV, Parquet, JSON, Excel (FileReader interface + registry)
   ingest.py         load → describe → profile → relate in one step (the app's Add data)
   profiler.py       standard column profile
-  relationships.py  FK discovery
+  relationships.py  FK discovery, cardinality
+  insights.py       grain, time coverage, dependencies → candidate entities / hierarchies, optional attributes / subtypes
+  codes.py          code lists and their comparison
+  compare.py        attribute comparison across a relationship
+  duplicates.py     near-duplicate records
+  dqrules.py        DQ rule suggestions → DQX / Great Expectations / Purview
   catalog.py        catalog cache, name search (exact/contains/fuzzy), value search
   export.py         xlsx / json / markdown
   demo.py           fictional demo dataset generator

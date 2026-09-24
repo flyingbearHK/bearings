@@ -43,6 +43,47 @@ export const api = {
   load: (body) => req('/api/load', { method: 'POST', body: JSON.stringify(body) }),
   orphans: (schemas) => req(`/api/annotations/orphans?${qs({ schemas })}`),
   remap: (body) => req('/api/annotations/remap', { method: 'POST', body: JSON.stringify(body) }),
+  // modelling insights (grain, time coverage, dependencies) + ER diagram
+  insights: (s, t) => req(`/api/table/${enc(s)}/${enc(t)}/insights`),
+  insightExceptions: (s, t, determinant, dependent, limit = 200) => req(`/api/table/${enc(s)}/${enc(t)}/insights/exceptions?${qs({ determinant, dependent, limit })}`),
+  runInsights: (body) => req('/api/insights', { method: 'POST', body: JSON.stringify(body) }),
+  dismissInsight: (body) => req('/api/insights/dismiss', { method: 'POST', body: JSON.stringify(body) }),
+  erd: (schemas, min_confidence) => req(`/api/erd.mmd?${qs({ schemas, min_confidence })}`),
+  erdBuild: (body) => req('/api/erd', { method: 'POST', body: JSON.stringify(body) }),
+  // phase 3: code lists, optional attributes, duplicates, attribute comparison, DQ rules
+  codeLists: (schemas) => req(`/api/codes?${qs({ schemas })}`),
+  codeValues: (ref, schemas) => req(`/api/codes/values?${qs({ ref, schemas })}`),
+  codeCompare: (left, right) => req(`/api/codes/compare?${qs({ left, right })}`),
+  breakdown: (s, t, column, by) => req(`/api/table/${enc(s)}/${enc(t)}/breakdown?${qs({ column, by })}`),
+  duplicateRoles: (s, t) => req(`/api/table/${enc(s)}/${enc(t)}/duplicates/roles`),
+  duplicates: (s, t, body) => req(`/api/table/${enc(s)}/${enc(t)}/duplicates`, { method: 'POST', body: JSON.stringify(body) }),
+  compare: (body) => req('/api/compare', { method: 'POST', body: JSON.stringify(body) }),
+  compareDiffs: (o) => req(`/api/compare/differences?${qs(o)}`),
+  dqRules: (o = {}) => req(`/api/dq/rules?${qs(o)}`),
+  dqExport: async (body) => {
+    const r = await fetch('/api/dq/export', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+    if (!r.ok) { let m = r.statusText; try { m = (await r.json()).detail || m } catch { /* */ } throw new Error(m) }
+    const name = (/filename="([^"]+)"/.exec(r.headers.get('content-disposition') || '') || [])[1] || 'dq_rules'
+    return { blob: await r.blob(), name }
+  },
+}
+
+/** Poll a background job until it finishes. */
+export const waitJob = async (job, onTick) => {
+  let j = job
+  while (j.status === 'running') {
+    await new Promise((r) => setTimeout(r, 600))
+    j = await api.job(j.id)
+    onTick?.(j)
+  }
+  return j
+}
+
+/** '2025-01' → 'Jan 2025' */
+export const monthLabel = (m) => {
+  if (!m) return ''
+  const [y, mo] = String(m).slice(0, 7).split('-')
+  return mo ? `${['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][Number(mo) - 1]} ${y}` : y
 }
 
 export const exportUrl = (fmt, schemas) => `/api/export/catalog.${fmt}${schemas ? `?schemas=${enc(schemas)}` : ''}`
@@ -114,4 +155,12 @@ export const splitHits = (text, term) => {
   }
   if (i < s.length) out.push({ t: s.slice(i), hit: false })
   return out
+}
+
+/** Save a Blob (or text) as a file. */
+export const saveFile = (data, name, type = 'text/plain') => {
+  const a = document.createElement('a')
+  a.href = URL.createObjectURL(data instanceof Blob ? data : new Blob([data], { type }))
+  a.download = name
+  a.click()
 }

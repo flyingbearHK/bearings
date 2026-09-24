@@ -15,8 +15,8 @@ from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from . import catalog, export, profiler, relationships
-from .db import META, DatabaseBusy, ann_connect, default_db_path, fq, qi, remote_aliases, ro
+from . import catalog, codes, compare, dqrules, duplicates, export, insights, profiler, relationships
+from .db import META, DatabaseBusy, ann_connect, connect, default_db_path, fq, qi, remote_aliases, ro
 
 DB = default_db_path()
 STATIC = Path(__file__).parent / "static"
@@ -117,7 +117,7 @@ def _default_scope():
 def stats(schemas: str | None = None):
     if not DB.exists():
         return {"db": str(DB), "exists": False, "tables": 0, "columns": 0, "profiled": 0, "relationships": 0,
-                "schemas": [], "default_scope": _default_scope()}
+                "schemas": [], "default_scope": _default_scope(), "version": __version__}
     sc = catalog.parse_schemas(schemas)
     with ro(DB) as con:
         full = catalog.build(con, DB)
@@ -145,7 +145,8 @@ def stats(schemas: str | None = None):
     rel = sum(1 for r in rels if not sc or (r["from_schema"] in sc and r["to_schema"] in sc))
     return {"db": str(DB), "exists": True, "tables": len(ts), "columns": sum(len(t["columns"]) for t in ts),
             "profiled": sum(1 for t in ts if t["profiled"]), "relationships": rel,
-            "schemas": sorted(per), "schema_stats": [per[k] for k in sorted(per)], "default_scope": _default_scope()}
+            "schemas": sorted(per), "schema_stats": [per[k] for k in sorted(per)], "default_scope": _default_scope(),
+            "version": __version__}
 
 
 @app.get("/api/tables")
@@ -205,10 +206,15 @@ def table_detail(schema: str, table: str):
         tprof, cprof = profiler.load_profile(con, schema, table)
         rels = [r for r in export.relationships(con)
                 if (r["from_schema"], r["from_table"]) == (schema, table) or (r["to_schema"], r["to_table"]) == (schema, table)]
+        ins = insights.read(con, schema, table)
     cols = []
     for c in tb["columns"]:
         cols.append({**c, "profile": cprof.get(c["column"])})
-    return jsonable({**{k: v for k, v in tb.items() if k != "columns"}, "columns": cols, "table_profile": tprof, "relationships": rels})
+    summary = {"computed_at": ins.get("computed_at"), "grain": ins.get("grain"),
+               "time": next((x for x in ins.get("time") or [] if x.get("is_primary")), None),
+               "dependency_count": len(ins.get("dependencies") or [])}
+    return jsonable({**{k: v for k, v in tb.items() if k != "columns"}, "columns": cols, "table_profile": tprof, "relationships": rels,
+                     "insights": summary})
 
 
 @app.get("/api/table/{schema}/{table}/sample")
@@ -442,12 +448,316 @@ def overlap(left: str, right: str):
                                      f"(bearings profile -t {e.args[0].rsplit('.', 1)[0]}) or pull it.")
         orphans = [r[0] for r in con.execute(
             f"SELECT v FROM ({a_sql}) WHERE v NOT IN (SELECT v FROM ({b_sql})) LIMIT 10", a_p + b_p).fetchall()]
+        try:
+            card = relationships.cardinality(con, ls, lt, lc, rs, rt, rc, local=local)
+        except Exception:
+            card = {}
+    if card:
+        card["summary"] = relationships.describe({**card, "from_table": lt, "from_column": lc, "to_table": rt, "to_column": rc})
     via = [f"{x['schema']}.{x['table']}" for x in (tl, tr) if catalog.is_remote(x)]
     return {"left": left, "right": right, "left_distinct": a, "left_in_right": m,
             "left_in_right_pct": round(100 * m / a, 2) if a else 0, "right_distinct": b, "right_in_left": m2,
             "right_in_left_pct": round(100 * m2 / b, 2) if b else 0, "left_orphans": orphans,
             "name_score": relationships.name_score(lc, rt, rc),
-            "via_fingerprints": via, "complete": a_full and b_full}
+            "via_fingerprints": via, "complete": a_full and b_full, **card}
+
+
+def _table_keys(tables) -> set[tuple[str, str]] | None:
+    if tables is None:
+        return None
+    items = tables.split(",") if isinstance(tables, str) else tables
+    out = set()
+    for x in items:
+        if x and "." in x:
+            s_, t = str(x).strip().split(".", 1)
+            out.add((s_, t))
+    return out
+
+
+@app.get("/api/erd.mmd", response_class=PlainTextResponse)
+def erd(schemas: str | None = None, min_confidence: float = 0.8, tables: str | None = None):
+    """Mermaid erDiagram of the relationships in scope (paste into a Markdown file, Mermaid Live or a Whiteboard).
+    tables = comma-separated schema.table: only those entities."""
+    sc = catalog.parse_schemas(schemas)
+    with ro(DB) as con:
+        return export.erd(con, catalog.scoped(catalog.build(con, DB), sc), sc, min_confidence=min_confidence,
+                          tables=_table_keys(tables))
+
+
+@app.post("/api/erd")
+def erd_post(body: dict = Body(default={})):
+    """Same as GET /api/erd.mmd for long table lists: body = {tables?: ["schema.table"], schemas?, min_confidence?}.
+    Returns {mermaid, model: {entities, links}, entities, links} – the model feeds the draw.io export."""
+    sch = body.get("schemas")
+    sc = catalog.parse_schemas(",".join(sch) if isinstance(sch, list) else sch)
+    keys = _table_keys(body.get("tables"))
+    with ro(DB) as con:
+        model = export.erd_model(con, catalog.scoped(catalog.build(con, DB), sc), sc,
+                                 min_confidence=float(body.get("min_confidence") if body.get("min_confidence") is not None else 0.8), tables=keys)
+    return {"mermaid": export.erd_mermaid(model), "model": model, "entities": len(model["entities"]), "links": len(model["links"])}
+
+
+# ---------------------------------------------------------------- modelling insights (grain, time coverage, dependencies)
+def _dismissed(schema: str, table: str) -> set[str]:
+    c = ann_connect(DB)
+    try:
+        return {r[0] for r in c.execute("SELECT item FROM dismissed_insights WHERE schema_name=? AND table_name=? AND kind='dependency'",
+                                        (schema, table)).fetchall()}
+    finally:
+        c.close()
+
+
+@app.get("/api/table/{schema}/{table}/insights")
+def table_insights(schema: str, table: str):
+    with ro(DB) as con:
+        cat = catalog.build(con, DB)
+        tb = _table_or_404(cat, schema, table)
+        ins = insights.read(con, schema, table)
+        _, prof = profiler.load_profile(con, schema, table)
+        columns = {k: [c["column"] for c in t_["columns"]] for k, t_ in cat["tables"].items()}
+        rels = relationships.with_targets(con, columns) if ins["available"] else []
+    cdm = {c["column"]: (c.get("annotation") or {}).get("cdm_entity") for c in tb["columns"] if (c.get("annotation") or {}).get("cdm_entity")}
+    dismissed = _dismissed(schema, table)
+    cols = {c: insights._col_info(p) for c, p in prof.items()}
+    st = insights.structure(ins["dependencies"], cols, rels, schema, table, cdm=cdm, dismissed=dismissed)
+    with ro(DB) as con:
+        optional = insights.optional_view(con, schema, table)
+        code_cols = [c for c in codes.lists(con) if (c["schema"], c["table"]) == (schema, table)]
+    return jsonable({**ins, "structure": st, "dismissed": sorted(dismissed), "is_remote": catalog.is_remote(tb),
+                     "profiled": bool(prof), "optional": optional, "code_lists": code_cols, **_source(tb, False)})
+
+
+@app.get("/api/table/{schema}/{table}/insights/exceptions")
+def insight_exceptions(schema: str, table: str, determinant: str, dependent: str, limit: int = 200):
+    """Rows that break a dependency (their dependent value isn't the usual one for their determinant)."""
+    with ro(DB) as con:
+        cat = catalog.build(con, DB)
+        tb = _local_or_409(_table_or_404(cat, schema, table))
+        valid = {c["column"] for c in tb["columns"]}
+        if determinant not in valid or dependent not in valid:
+            raise HTTPException(400, "Unknown column")
+        sql = insights.exceptions_sql(schema, table, determinant, dependent, max(1, min(limit, 1000)))
+        cur = con.execute(sql)
+        cols = [d[0] for d in cur.description]
+        rows = cur.fetchall()
+    return jsonable({"columns": cols, "rows": rows, "sql": sql, **_source(tb, False)})
+
+
+def _run_insights_job(job_id: str, targets: list[tuple[str, str]], only: set[str] | None):
+    job = _jobs[job_id]
+    for s_, t in targets:
+        job["current"] = f"{s_}.{t}"
+        con = connect(DB, read_only=False, retries=10)
+        try:
+            r = insights.run(con, s_, t, only=only)
+            job["results"].append({"table": f"{s_}.{t}", "seconds": r["seconds"], "on_sample": r["on_sample"]})
+        except Exception as e:  # noqa: BLE001
+            job["errors"].append({"table": f"{s_}.{t}", "error": str(e).splitlines()[0] if str(e) else type(e).__name__})
+        finally:
+            con.close()
+        job["done"] = len(job["results"]) + len(job["errors"])
+    catalog._cache["key"] = None
+    job.update(status="failed" if job["errors"] and not job["results"] else "done", current=None,
+               finished_at=dt.datetime.now().isoformat(timespec="seconds"))
+
+
+@app.post("/api/insights")
+def run_insights(body: dict = Body(default={})):
+    """Compute modelling insights for local / cached tables (background job unless wait=true).
+    body = {tables?: ["schema.table"], schemas?: [...], only?: ["grain","time","deps"], wait?: bool}"""
+    only = set(body.get("only") or []) or None
+    if only and only - set(insights.KINDS):
+        raise HTTPException(400, f"only takes {', '.join(insights.KINDS)}")
+    with ro(DB) as con:
+        targets = insights.targets(con, set(body.get("schemas") or []) or None, body.get("tables") or None)
+    if not targets:
+        raise HTTPException(400, "Nothing to analyse: profile the table first (remote tables need a local copy – ⤓ Cache locally)")
+    with _jobs_lock:
+        job_id = uuid.uuid4().hex[:12]
+        _jobs[job_id] = {"id": job_id, "kind": "insights", "tables": [f"{a}.{b}" for a, b in targets], "total": len(targets),
+                         "done": 0, "status": "running", "current": None, "results": [], "errors": [],
+                         "started_at": dt.datetime.now().isoformat(timespec="seconds")}
+    if body.get("wait"):
+        _run_insights_job(job_id, targets, only)
+    else:
+        threading.Thread(target=_run_insights_job, args=(job_id, targets, only), daemon=True).start()
+    return jsonable(_jobs[job_id])
+
+
+@app.post("/api/insights/dismiss")
+def dismiss_insight(body: dict = Body(...)):
+    """Hide (or, with undo, show again) a dependency: body = {schema, table, item: "determinant->dependent", undo?}.
+    Stored with the annotations, so it survives rebuilding the database."""
+    s_, t, item = body.get("schema"), body.get("table"), body.get("item")
+    if not s_ or not t or not item or "->" not in item:
+        raise HTTPException(400, "schema, table and item (determinant->dependent) are required")
+    c = ann_connect(DB)
+    try:
+        if body.get("undo"):
+            c.execute("DELETE FROM dismissed_insights WHERE schema_name=? AND table_name=? AND kind='dependency' AND item=?", (s_, t, item))
+        else:
+            c.execute("INSERT OR REPLACE INTO dismissed_insights VALUES (?,?,?,?,?)",
+                      (s_, t, "dependency", item, dt.datetime.now().isoformat(timespec="seconds")))
+        c.commit()
+    finally:
+        c.close()
+    return {"ok": True, "dismissed": sorted(_dismissed(s_, t))}
+
+
+@app.get("/api/table/{schema}/{table}/breakdown")
+def breakdown(schema: str, table: str, column: str, by: str, limit: int = 50):
+    """How a column behaves per value of another (e.g. how often cancel_date is filled per status_code)."""
+    with ro(DB) as con:
+        cat = catalog.build(con, DB)
+        tb = _local_or_409(_table_or_404(cat, schema, table))
+        types = {c["column"]: c["type"] for c in tb["columns"]}
+        if column not in types or by not in types:
+            raise HTTPException(400, "Unknown column")
+        fx = insights.filled_expr(column, types[column])
+        q, b, src = qi(column), qi(by), fq(schema, table)
+        sql = (f"SELECT CAST({b} AS VARCHAR) AS {qi(by)}, count(*) AS rows, count(*) FILTER (WHERE {fx}) AS filled,\n"
+               f"       round(100.0 * count(*) FILTER (WHERE {fx}) / count(*), 1) AS filled_pct, count(DISTINCT {q}) AS distinct_values,\n"
+               f"       CAST(mode({q}) AS VARCHAR) AS most_common\nFROM {src} GROUP BY 1 ORDER BY 2 DESC LIMIT {max(1, min(limit, 500))}")
+        cur = con.execute(sql)
+        cols = [d[0] for d in cur.description]
+        rows = cur.fetchall()
+        total = con.execute(f"SELECT count(*), count(*) FILTER (WHERE {fx}) FROM {src}").fetchone()
+    return jsonable({"column": column, "by": by, "columns": cols, "rows": rows, "sql": sql, "total_rows": total[0],
+                     "total_filled": total[1], **_source(tb, False)})
+
+
+# ---------------------------------------------------------------- near-duplicate records
+@app.get("/api/table/{schema}/{table}/duplicates/roles")
+def duplicate_roles(schema: str, table: str):
+    with ro(DB) as con:
+        cat = catalog.build(con, DB)
+        tb = _table_or_404(cat, schema, table)
+        return {"roles": duplicates.roles(con, schema, table), "all_roles": list(duplicates.WEIGHT),
+                "columns": [c["column"] for c in tb["columns"]]}
+
+
+@app.post("/api/table/{schema}/{table}/duplicates")
+def find_duplicates(schema: str, table: str, body: dict = Body(default={})):
+    """body = {columns?: {role: column}, threshold?: 0.9, limit?: 50}"""
+    with ro(DB) as con:
+        cat = catalog.build(con, DB)
+        tb = _local_or_409(_table_or_404(cat, schema, table))
+        valid = {c["column"] for c in tb["columns"]}
+        cols = {r: c for r, c in (body.get("columns") or {}).items() if c in valid and r in duplicates.WEIGHT} or None
+        t0 = time.time()
+        res = duplicates.find(con, schema, table, cols, threshold=float(body.get("threshold") or 0.9),
+                              limit=max(1, min(int(body.get("limit") or 50), 500)))
+    return jsonable({**res, "elapsed_ms": round((time.time() - t0) * 1000), **_source(tb, False)})
+
+
+# ---------------------------------------------------------------- code lists
+def _ref(ref: str) -> tuple[str, str, str]:
+    parts = ref.split(".")
+    if len(parts) < 3:
+        raise HTTPException(400, "Use schema.table.column")
+    return parts[0], parts[1], ".".join(parts[2:])
+
+
+@app.get("/api/codes")
+def code_lists(schemas: str | None = None):
+    with ro(DB) as con:
+        return jsonable(codes.lists(con, catalog.parse_schemas(schemas)))
+
+
+@app.get("/api/codes/values")
+def code_values(ref: str, schemas: str | None = None):
+    s_, t, c = _ref(ref)
+    with ro(DB) as con:
+        return jsonable({"ref": ref, "values": codes.values(con, s_, t, c),
+                         "similar": codes.similar(con, s_, t, c, catalog.parse_schemas(schemas))})
+
+
+@app.get("/api/codes/compare")
+def code_compare(left: str, right: str):
+    with ro(DB) as con:
+        return jsonable(codes.compare(con, _ref(left), _ref(right)))
+
+
+# ---------------------------------------------------------------- attribute comparison across a link
+def _cmp_inputs(con, cat, left: str, right: str):
+    (ls, lt, lk), (rs, rt, rk) = _ref(left), _ref(right)
+    tl, tr = _table_or_404(cat, ls, lt), _table_or_404(cat, rs, rt)
+    for tb in (tl, tr):
+        _local_or_409(tb)
+    _, pl = profiler.load_profile(con, ls, lt)
+    _, pr = profiler.load_profile(con, rs, rt)
+    hints = {**{("l", c): p.get("type_hint") for c, p in pl.items() if p.get("type_hint")},
+             **{("r", c): p.get("type_hint") for c, p in pr.items() if p.get("type_hint")}}
+    return ((ls, lt, lk), (rs, rt, rk), {c["column"]: c["type"] for c in tl["columns"]},
+            {c["column"]: c["type"] for c in tr["columns"]}, hints)
+
+
+@app.post("/api/compare")
+def compare_attributes(body: dict = Body(...)):
+    """Compare the attributes of linked records. body = {left: "schema.table.key", right: "schema.table.key",
+    pairs?: [[left_col, right_col]]}"""
+    with ro(DB) as con:
+        cat = catalog.build(con, DB)
+        L, R, cl, cr, hints = _cmp_inputs(con, cat, body.get("left") or "", body.get("right") or "")
+        pairs = [tuple(p) for p in body.get("pairs") or []] or None
+        t0 = time.time()
+        res = compare.attributes(con, L, R, cl, cr, hints, pairs)
+    return jsonable({**res, "left_columns": list(cl), "right_columns": list(cr), "elapsed_ms": round((time.time() - t0) * 1000)})
+
+
+@app.get("/api/compare/differences")
+def compare_differences(left: str, right: str, left_column: str, right_column: str, limit: int = 100):
+    with ro(DB) as con:
+        cat = catalog.build(con, DB)
+        L, R, cl, cr, hints = _cmp_inputs(con, cat, left, right)
+        if left_column not in cl or right_column not in cr:
+            raise HTTPException(400, "Unknown column")
+        sql = compare.differences_sql(L, R, left_column, right_column, (cl[left_column], cr[right_column]), hints,
+                                      max(1, min(limit, 1000)))
+        cur = con.execute(sql)
+        return jsonable({"columns": [d[0] for d in cur.description], "rows": cur.fetchall(), "sql": sql})
+
+
+# ---------------------------------------------------------------- data-quality rule suggestions
+def _dq_rules(con, cat, schemas: set[str] | None, tables) -> list[dict]:
+    keys = _table_keys(tables)
+    tabs = [k for k in cat["tables"] if (not schemas or k[0] in schemas) and (keys is None or k in keys)]
+    return dqrules.all_rules(con, cat, tabs)
+
+
+@app.get("/api/dq/rules")
+def dq_rules(schemas: str | None = None, tables: str | None = None):
+    sc = catalog.parse_schemas(schemas)
+    with ro(DB) as con:
+        cat = catalog.build(con, DB)
+        return jsonable(_dq_rules(con, cat, sc, tables))
+
+
+@app.post("/api/dq/export")
+def dq_export(body: dict = Body(default={})):
+    """body = {tables?: ["schema.table"], schemas?: [...], ids?: [rule ids to keep], format: zip | dqx | gx | csv}"""
+    sch = body.get("schemas")
+    sc = catalog.parse_schemas(",".join(sch) if isinstance(sch, list) else sch)
+    with ro(DB) as con:
+        cat = catalog.build(con, DB)
+        rules = _dq_rules(con, cat, sc, body.get("tables"))
+    ids = set(body.get("ids") or [])
+    if ids:
+        rules = [r for r in rules if r["id"] in ids]
+    if not rules:
+        raise HTTPException(400, "No rules to export")
+    fmt = body.get("format") or "zip"
+    stem = f"dq_rules_{rules[0]['schema']}.{rules[0]['table']}" if len({(r['schema'], r['table']) for r in rules}) == 1 else "dq_rules"
+    if fmt == "dqx":
+        return Response(dqrules.to_dqx_yaml(rules, rules[0]["dataset"] if stem != "dq_rules" else ""), media_type="text/yaml",
+                        headers={"Content-Disposition": f'attachment; filename="{stem}.dqx.yml"'})
+    if fmt == "gx":
+        import json as _json
+        return Response(_json.dumps(dqrules.to_gx_suite(rules, stem.replace("dq_rules_", "") or "bearings"), indent=2, ensure_ascii=False),
+                        media_type="application/json", headers={"Content-Disposition": f'attachment; filename="{stem}.gx.json"'})
+    if fmt == "csv":
+        return Response(dqrules.to_csv(rules), media_type="text/csv", headers={"Content-Disposition": f'attachment; filename="{stem}.purview.csv"'})
+    return Response(dqrules.bundle(rules), media_type="application/zip", headers={"Content-Disposition": f'attachment; filename="{stem}.zip"'})
 
 
 # ---------------------------------------------------------------- annotations
@@ -680,7 +990,7 @@ def _run_load_job(job_id: str, src: Path, schema: str, opts, body: dict):
                          relate=body.get("relate", True) is not False, progress=lambda p: job.update(p))
         job["results"] = res["loaded"]
         job["errors"] = res["errors"]
-        job["summary"] = {k: res[k] for k in ("schema", "comments", "profiled", "relationships", "seconds")}
+        job["summary"] = {k: res.get(k) for k in ("schema", "comments", "profiled", "relationships", "analysed", "seconds")}
         job["status"] = "failed" if res["errors"] and not res["loaded"] else "done"
     except Exception as e:  # noqa: BLE001 - report anything to the UI
         job["errors"].append({"table": "", "error": str(e).splitlines()[0] if str(e) else type(e).__name__})

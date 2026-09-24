@@ -16,6 +16,22 @@ EMAIL_RE = r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
 PHONE_RE = r"^\+?\(?[0-9][0-9 ()\-.]{6,}$"
 
 
+# values that stand in for "no value" (compared upper-cased and trimmed; blanks are counted separately)
+PLACEHOLDERS = ("N/A", "N.A.", "#N/A", "NULL", "(NULL)", "NONE", "NIL", "-", "--", "---", "?", ".", "UNKNOWN", "UNK",
+                "TBD", "TBA", "NOT APPLICABLE", "NOT AVAILABLE", "MISSING", "(BLANK)", "0000-00-00", "1900-01-01",
+                "01/01/1900", "9999-12-31", "31/12/9999")
+KEYISH_NAME = re.compile(r"(_?(id|key|code|no|num|nbr|number|cd|ref))$", re.I)
+DATEISH_NAME = re.compile(r"(date|_dt$|^dt_|_dt_|_on$|time|_ts$|^ts_|day|period|month|year)", re.I)
+# text → date formats tried in this order (the first that parses wins, so each value counts once)
+DATE_FORMATS = ("%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%d.%m.%Y", "%Y/%m/%d", "%d-%b-%Y", "%d %b %Y", "%d-%m-%Y")
+BOOL_WORDS = ("Y", "N", "YES", "NO", "TRUE", "FALSE", "T", "F")
+HINT_SHARE = 0.95   # share of the (non-placeholder) values that must parse before a type is suggested
+
+
+def _sql_list(vals) -> str:
+    return ", ".join("'" + v.replace("'", "''") + "'" for v in vals)
+
+
 def family(dtype: str) -> str:
     d = dtype.strip()
     if NUMERIC.match(d):
@@ -162,6 +178,17 @@ def profile_table(con, schema: str, table: str, columns: list[str] | None = None
         except Exception as e:
             errors.append(f"histogram: {str(e).splitlines()[0]}")
             hist = []
+        try:
+            if f == "numeric" and nn and not KEYISH_NAME.search(c):
+                p.update(outliers(con, src, c, p))
+        except Exception as e:
+            errors.append(f"outliers: {str(e).splitlines()[0]}")
+        try:
+            p.update(disguised_nulls(con, src, c, t, nn))
+        except Exception as e:
+            errors.append(f"placeholders / type hint: {str(e).splitlines()[0]}")
+        empty = (p["null_count"] or 0) + (p.get("blank_count") or 0) + (p.get("placeholder_count") or 0)
+        p["effective_null_pct"] = round(100.0 * empty / p["row_count"], 2) if p["row_count"] else 0.0
         p["errors"] = errors
         p.update(email_share=email_share, phone_share=phone_share, approx=approx, pattern_base=nn)
         flags = compute_flags(p, patterns)
@@ -175,6 +202,90 @@ def profile_table(con, schema: str, table: str, columns: list[str] | None = None
         "errors": [f"{p['column_name']}: {e}" for p in results for e in p.get("errors", [])],
     }
     return tprof, results
+
+
+def outliers(con, src: str, column: str, p: dict) -> dict:
+    """Far-out values (Tukey fences at 3 × IQR) and negative values of a numeric column, with the most extreme examples."""
+    out = {"outlier_count": 0, "outlier_low": None, "outlier_high": None, "outlier_values": [], "negative_count": 0}
+    q = f"CAST({qi(column)} AS DOUBLE)"
+    out["negative_count"] = con.execute(f"SELECT count(*) FROM {src} WHERE {q} < 0").fetchone()[0]
+    try:
+        q1, q3 = float(p.get("p25")), float(p.get("p75"))
+    except (TypeError, ValueError):
+        return out
+    iqr = q3 - q1
+    if iqr <= 0:
+        return out
+    lo, hi = q1 - OUTLIER_IQR * iqr, q3 + OUTLIER_IQR * iqr
+    out.update(outlier_low=round(lo, 6), outlier_high=round(hi, 6))
+    rows = con.execute(f"""SELECT v, count(*) FROM (SELECT {q} v FROM {src} WHERE {q} < $lo OR {q} > $hi)
+                           GROUP BY 1 ORDER BY abs(v - $mid) DESC LIMIT 5""", {"lo": lo, "hi": hi, "mid": (q1 + q3) / 2}).fetchall()
+    out["outlier_count"] = con.execute(f"SELECT count(*) FROM {src} WHERE {q} < $lo OR {q} > $hi", {"lo": lo, "hi": hi}).fetchone()[0]
+    out["outlier_values"] = [{"v": v, "n": n} for v, n in rows]
+    return out
+
+
+def disguised_nulls(con, src: str, column: str, dtype: str, non_null: int) -> dict:
+    """Placeholder values that mean "no value" (N/A, -, 1900-01-01, 0 / -1 in a key column…), and for text columns the
+    type most values would parse as (with the date formats seen) plus how many values have leading zeros."""
+    out = {"placeholder_count": 0, "placeholder_values": [], "type_hint": None, "leading_zero_count": 0}
+    if not non_null:
+        return out
+    f, q = family(dtype), qi(column)
+    if f == "string":
+        cond = f"upper(trim({q})) IN ({_sql_list(PLACEHOLDERS + (('0', '-1') if KEYISH_NAME.search(column) else ()))})"
+    elif f == "temporal":
+        cond = f"(year({q}) <= 1900 OR year({q}) >= 9999)"
+    elif f == "numeric" and KEYISH_NAME.search(column):
+        cond = f"CAST({q} AS DOUBLE) IN (0, -1)"
+    else:
+        return out
+    ph = con.execute(f"SELECT CAST({q} AS VARCHAR), count(*) FROM {src} WHERE {q} IS NOT NULL AND {cond} "
+                     "GROUP BY 1 ORDER BY 2 DESC, 1").fetchall()
+    out["placeholder_count"] = sum(n for _, n in ph)
+    out["placeholder_values"] = [{"v": v, "n": n} for v, n in ph[:5]]
+    if f != "string":
+        return out
+    v = f"trim({q})"
+    ymd = (f"WHEN length({v}) = 8 AND TRY_STRPTIME({v}, '%Y%m%d') IS NOT NULL THEN 'date:%Y%m%d' "
+           if DATEISH_NAME.search(column) else "")
+    dates = " ".join(f"WHEN TRY_STRPTIME({v}, '{fmt}') IS NOT NULL THEN 'date:{fmt}'" for fmt in DATE_FORMATS)
+    kinds = dict(con.execute(f"""
+        SELECT k, count(*) FROM (
+          SELECT CASE {ymd}
+                   WHEN regexp_full_match({v}, '[+-]?[0-9]+') THEN 'int'
+                   WHEN regexp_full_match({v}, '[+-]?([0-9]+[.][0-9]*|[.][0-9]+)') THEN 'decimal'
+                   WHEN upper({v}) IN ({_sql_list(BOOL_WORDS)}) THEN 'bool'
+                   {dates}
+                   WHEN TRY_CAST({v} AS TIMESTAMP) IS NOT NULL THEN 'timestamp'
+                   ELSE 'text' END AS k
+          FROM {src} WHERE {q} IS NOT NULL AND {v} <> '' AND NOT ({cond})) GROUP BY 1""").fetchall())
+    total = sum(kinds.values())
+    out["leading_zero_count"] = con.execute(
+        f"SELECT count(*) FROM {src} WHERE regexp_full_match(trim({q}), '0[0-9]+')").fetchone()[0] if kinds.get("int") else 0
+    if not total:
+        return out
+    share = lambda *ks: sum(kinds.get(k, 0) for k in ks) / total
+    date_ks = [k for k in kinds if k.startswith("date:")]
+    hint = None
+    if share("int") >= HINT_SHARE and not out["leading_zero_count"]:
+        hint = {"type": "BIGINT", "share": share("int")}
+    elif share("int", "decimal") >= HINT_SHARE and kinds.get("decimal") and not out["leading_zero_count"]:
+        hint = {"type": "DECIMAL", "share": share("int", "decimal")}
+    elif share("bool") >= HINT_SHARE and len(kinds) == 1:
+        hint = {"type": "BOOLEAN", "share": share("bool")}
+    elif date_ks and share(*date_ks) >= HINT_SHARE:
+        hint = {"type": "DATE", "share": share(*date_ks)}
+    elif (date_ks or kinds.get("timestamp")) and share("timestamp", *date_ks) >= HINT_SHARE:
+        hint = {"type": "TIMESTAMP", "share": share("timestamp", *date_ks)}
+    if hint:
+        hint["share"] = round(hint["share"], 4)
+        hint["checked"] = total
+        if date_ks:
+            n_dates = sum(kinds[k] for k in date_ks)
+            hint["formats"] = {k[5:]: round(kinds[k] / n_dates, 4) for k in sorted(date_ks, key=lambda k: -kinds[k])}
+        out["type_hint"] = hint
+    return out
 
 
 def compute_flags(p: dict, patterns: list[dict]) -> list[str]:
@@ -212,6 +323,16 @@ def compute_flags(p: dict, patterns: list[dict]) -> list[str]:
             flags.append("mixed_format")
     if (p["blank_count"] or 0) > 0:
         flags.append("has_blanks")
+    if (p.get("placeholder_count") or 0) > 0:
+        flags.append("placeholders")
+    if p.get("type_hint"):
+        flags.append("type_hint")
+    if (p.get("leading_zero_count") or 0) > 0:
+        flags.append("leading_zeros")
+    if (p.get("outlier_count") or 0) > 0:
+        flags.append("outliers")
+    if nn and 0 < (p.get("negative_count") or 0) <= 0.05 * nn:
+        flags.append("negatives")   # a few negatives in a mostly positive column: refunds, reversals or errors
     if p.get("errors"):
         flags.append("profile_error")
     return flags
@@ -235,6 +356,11 @@ def _fmt_epoch(e, dtype="TIMESTAMP"):
 COLS = ["schema_name", "table_name", "column_name", "ordinal", "data_type", "row_count", "null_count", "null_pct",
         "blank_count", "distinct_count", "distinct_pct", "min_val", "max_val", "mean", "stddev", "p25", "p50", "p75",
         "min_len", "avg_len", "max_len", "top_values", "patterns", "histogram", "flags", "profiled_at"]
+# v0.4 columns (older databases opened read-only may not have them yet)
+COLS_V4 = ["placeholder_count", "placeholder_values", "effective_null_pct", "type_hint", "leading_zero_count",
+           "outlier_count", "outlier_low", "outlier_high", "outlier_values", "negative_count"]
+JSON_COLS = ("top_values", "patterns", "histogram", "flags", "placeholder_values", "type_hint", "outlier_values")
+OUTLIER_IQR = 3.0   # "far out": beyond Q1 − 3·IQR or Q3 + 3·IQR
 
 
 def save(con, tprof: dict, cols: list[dict]):
@@ -245,13 +371,15 @@ def save(con, tprof: dict, cols: list[dict]):
                 "VALUES (?,?,?,?,?,?,?)",
                 [s, t, tprof["row_count"], tprof["column_count"], json.dumps(tprof["candidate_keys"]), tprof["sampled_rows"], now])
     con.execute(f"DELETE FROM {META}.column_profile WHERE schema_name=? AND table_name=?", [s, t])
+    names = COLS + COLS_V4
     rows = []
     for p in cols:
         d = dict(p, profiled_at=now)
-        for k in ("top_values", "patterns", "histogram", "flags"):
-            d[k] = json.dumps(d[k], default=str)
-        rows.append([d.get(k) for k in COLS])
-    con.executemany(f"INSERT INTO {META}.column_profile ({', '.join(COLS)}) VALUES ({', '.join('?' * len(COLS))})", rows)
+        for k in JSON_COLS:
+            if k in d:
+                d[k] = json.dumps(d[k], default=str) if d[k] is not None else None
+        rows.append([d.get(k) for k in names])
+    con.executemany(f"INSERT INTO {META}.column_profile ({', '.join(names)}) VALUES ({', '.join('?' * len(names))})", rows)
 
 
 def load_profile(con, schema: str, table: str):
@@ -263,12 +391,20 @@ def load_profile(con, schema: str, table: str):
     if t:
         tp = {"row_count": t[0], "column_count": t[1], "candidate_keys": json.loads(t[2] or "[]"),
               "sampled_rows": t[3], "profiled_at": str(t[4]), "stale": bool(t[5])}
-    cur = con.execute(f"SELECT {', '.join(COLS)} FROM {META}.column_profile WHERE schema_name=? AND table_name=? ORDER BY ordinal", [schema, table])
+        if has_meta_column(con, "table_profile", "grain"):
+            g = con.execute(f"SELECT grain, grain_dup_rows, grain_on_sample, insights_at FROM {META}.table_profile "
+                            "WHERE schema_name=? AND table_name=?", [schema, table]).fetchone()
+            tp.update(grain=json.loads(g[0]) if g[0] else None, grain_dup_rows=g[1], grain_on_sample=bool(g[2]),
+                      insights_at=str(g[3]) if g[3] else None)
+    names = COLS + (COLS_V4 if has_meta_column(con, "column_profile", "outlier_count") else
+                    COLS_V4[:5] if has_meta_column(con, "column_profile", "type_hint") else [])
+    cur = con.execute(f"SELECT {', '.join(names)} FROM {META}.column_profile WHERE schema_name=? AND table_name=? ORDER BY ordinal", [schema, table])
     cols = {}
     for r in cur.fetchall():
-        d = dict(zip(COLS, r))
-        for k in ("top_values", "patterns", "histogram", "flags"):
-            d[k] = json.loads(d[k] or "[]")
+        d = dict(zip(names, r))
+        for k in ("top_values", "patterns", "histogram", "flags", "placeholder_values", "outlier_values"):
+            d[k] = json.loads(d.get(k) or "[]")
+        d["type_hint"] = json.loads(d["type_hint"]) if d.get("type_hint") else None
         d["profiled_at"] = str(d["profiled_at"])
         cols[d["column_name"]] = d
     return tp, cols

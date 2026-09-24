@@ -9,7 +9,7 @@ from typing import List, Optional
 
 import typer
 
-from . import loader, profiler, relationships
+from . import insights, loader, profiler, relationships
 from .db import (DatabaseBusy, annotations_path, compact as compact_db, connect, default_db_path, delete_annotations,
                  drop_schema, drop_table, remote_aliases, user_tables)
 
@@ -159,10 +159,138 @@ def relate(min_overlap: float = typer.Option(0.5, help="Minimum share of FK valu
                                   max_pairs=max_pairs, echo=typer.echo, schemas=sc)
     relationships.save(con, rels, schemas=sc)
     for r in sorted(rels, key=lambda r: -r["confidence"])[:40]:
+        card = r.get("cardinality") or ""
+        extra = ""
+        if card:
+            extra = f"  {card:<3} {'optional' if r.get('fk_null_pct') else 'mandatory':<9}"
+            if r.get("orphan_rows"):
+                extra += f" {r['orphan_rows']:,} orphan rows"
         typer.echo(f"  {r['from_table']}.{r['from_column']:<28} → {r['to_table']}.{r['to_column']:<24} "
-                   f"overlap {r['overlap_pct']:>6}%  conf {r['confidence']}")
-    typer.secho(f"Done: {len(rels)} relationships in {time.time() - t0:.1f}s", fg="green")
+                   f"overlap {r['overlap_pct']:>6}%  conf {r['confidence']:<5}{extra}")
+    typer.secho(f"Done: {len(rels)} relationships in {time.time() - t0:.1f}s. Next: bearings insights", fg="green")
     con.close()
+
+
+@app.command("insights")
+def insights_cmd(table: Optional[List[str]] = typer.Option(None, "--table", "-t", help="schema.table (repeatable). Default: all profiled local / cached tables"),
+                 only: Optional[str] = typer.Option(None, "--only", help="Comma-separated subset: grain,time,deps,codes,optional"),
+                 sample_rows: int = typer.Option(insights.DEFAULT_SAMPLE, "--sample-rows", help="Scan a random sample of N rows of bigger tables"),
+                 show: bool = typer.Option(False, "--show", help="Print candidate entities, hierarchies and dirty dependencies"),
+                 schema: Optional[List[str]] = SchemaOpt,
+                 db: Optional[Path] = DbOpt):
+    """Modelling insights: the grain of each table, time coverage of its date columns, and dependencies between columns
+    (candidate entities, hierarchies, code ↔ description pairs). Needs `bearings profile` first; runs on local and
+    cached tables."""
+    kinds = {k.strip() for k in only.split(",")} if only else None
+    if kinds and kinds - set(insights.KINDS):
+        typer.secho(f"--only takes {', '.join(insights.KINDS)}", fg="red")
+        raise typer.Exit(1)
+    dbp = _db(db)
+    con = _rw(dbp)
+    tabs = insights.targets(con, set(schema) if schema else None, table)
+    if not tabs:
+        typer.echo("Nothing to analyse (profile the tables first: bearings profile).")
+        con.close()
+        return
+    t0 = time.time()
+    done, errors = insights.run_many(con, tabs, sample_rows=sample_rows, only=kinds, echo=typer.echo)
+    if show:
+        rels = relationships.with_targets(con, catalog_columns(con))
+        for r in done:
+            _print_structure(con, r["schema"], r["table"], rels)
+    con.close()
+    typer.secho(f"Done: {len(done)} table(s) in {time.time() - t0:.1f}s" + (f", {len(errors)} failed" if errors else ""), fg="green")
+
+
+@app.command("dq-rules")
+def dq_rules_cmd(out: Path = typer.Option(Path("dq_rules.zip"), "--out", "-o",
+                                          help=".zip (DQX + Great Expectations + Purview CSV), .yml (DQX), .json (Great Expectations) or .csv (Purview)"),
+                 table: Optional[List[str]] = typer.Option(None, "--table", "-t", help="schema.table (repeatable)"),
+                 errors_only: bool = typer.Option(False, "--errors-only", help="Only rules that pass on every row today"),
+                 schema: Optional[List[str]] = SchemaOpt, db: Optional[Path] = DbOpt):
+    """Suggest data-quality rules from the profile, insights and relationships, and export them for Databricks DQX,
+    Great Expectations or Microsoft Purview."""
+    from . import catalog as cat_mod, dqrules
+    dbp = _db(db)
+    con = connect_db(dbp, read_only=True)
+    cat = cat_mod.build(con, dbp)
+    tabs = [k for k in cat["tables"] if (not schema or k[0] in schema)
+            and (not table or f"{k[0]}.{k[1]}".lower() in {t.lower() for t in table} or k[1].lower() in {t.lower() for t in table})]
+    rules = dqrules.all_rules(con, cat, tabs)
+    con.close()
+    if errors_only:
+        rules = [r for r in rules if r["criticality"] == "error"]
+    if not rules:
+        typer.echo("No rules (profile and analyse the tables first: bearings profile && bearings insights).")
+        raise typer.Exit(1)
+    suf = out.suffix.lower()
+    if suf in (".yml", ".yaml"):
+        out.write_text(dqrules.to_dqx_yaml(rules), encoding="utf-8")
+    elif suf == ".json":
+        out.write_text(json.dumps(dqrules.to_gx_suite(rules, out.stem), indent=2, ensure_ascii=False), encoding="utf-8")
+    elif suf == ".csv":
+        out.write_text(dqrules.to_csv(rules), encoding="utf-8")
+    else:
+        out.write_bytes(dqrules.bundle(rules))
+    by = {}
+    for r in rules:
+        by[r["criticality"]] = by.get(r["criticality"], 0) + 1
+    typer.secho(f"{len(rules)} rules for {len({(r['schema'], r['table']) for r in rules})} table(s) "
+                f"({by.get('error', 0)} error, {by.get('warn', 0)} warn) → {out}", fg="green")
+
+
+@app.command("duplicates")
+def duplicates_cmd(table: str = typer.Argument(..., help="schema.table"),
+                   threshold: float = typer.Option(0.9, help="Minimum similarity (0-1)"),
+                   column: Optional[List[str]] = typer.Option(None, "--column", "-c", help="role=column, e.g. email=EmailAddr (repeatable; default: guessed)"),
+                   limit: int = typer.Option(20, help="Example pairs to print"),
+                   db: Optional[Path] = DbOpt):
+    """Find near-duplicate records (same person captured twice): blocks on email / phone / name / birth date, scores
+    pairs with exact and Jaro-Winkler comparisons."""
+    from . import duplicates
+    if "." not in table:
+        typer.secho("Use schema.table", fg="red")
+        raise typer.Exit(1)
+    s_, t = table.split(".", 1)
+    cols = dict(x.split("=", 1) for x in column or [] if "=" in x) or None
+    con = connect_db(_db(db), read_only=True)
+    res = duplicates.find(con, s_, t, cols, threshold=threshold, limit=limit)
+    con.close()
+    typer.echo(f"Columns: {', '.join(f'{r}={c}' for r, c in res['columns'].items())}")
+    if res.get("error"):
+        typer.secho(res["error"], fg="yellow")
+        raise typer.Exit(1)
+    typer.secho(f"{res['pairs']:,} likely duplicate pairs in {res['groups']:,} groups ({res['rows_in_groups']:,} of {res['rows']:,} rows)",
+                fg="green")
+    half = (len(res["example_columns"]) - 1) // 2
+    for row in res["examples"]:
+        typer.echo(f"  {row[0]:.3f}  " + " | ".join(str(x) for x in row[1:1 + half]) + "   ≈   " + " | ".join(str(x) for x in row[1 + half:]))
+
+
+def catalog_columns(con) -> dict:
+    cols: dict = {}
+    for s_, t, c in con.execute("SELECT table_schema, table_name, column_name FROM information_schema.columns "
+                                "WHERE table_schema <> '_meta' AND table_catalog = current_database()").fetchall():
+        cols.setdefault((s_, t), []).append(c)
+    return cols
+
+
+def _print_structure(con, s_: str, t: str, rels: list[dict]):
+    _, prof = profiler.load_profile(con, s_, t)
+    st = insights.structure(insights.read(con, s_, t)["dependencies"], {c: insights._col_info(p) for c, p in prof.items()},
+                            rels, s_, t)
+    if not (st["entities"] or st["dirty"] or st["notes"]):
+        return
+    typer.secho(f"  {s_}.{t}", bold=True)
+    for e in st["entities"]:
+        det = ", ".join(" = ".join(d["columns"]) for d in e["determines"])
+        typer.echo(f"    ▸ {e['name']:<16} {' = '.join(e['columns'])}" + (f"  →  {det}" if det else ""))
+    for h in st["hierarchies"]:
+        typer.echo("    ⤷ hierarchy: " + " → ".join(lv["name"] for lv in h["levels"]))
+    for d in st["dirty"]:
+        typer.secho(f"    ⚠ {d['sentence']}", fg="yellow")
+    for n in st["notes"]:
+        typer.echo(f"    ℹ {n['sentence']}")
 
 
 @app.command()
@@ -312,19 +440,20 @@ def demo(out: Path = typer.Option(Path("demo"), "--out", "-o", help="Folder for 
          scale: float = typer.Option(1.0, "--scale", help="Data volume multiplier (1 = ~30k reservations, 90k charges)"),
          files_only: bool = typer.Option(False, "--files-only", help="Only write the files; don't load/profile"),
          db: Optional[Path] = typer.Option(Path("data/demo.duckdb"), "--db", help="Demo database (kept apart from your real one)")):
-    """Generate a fictional hotel dataset (PMS + CRM) and load, profile and relate it – ready to explore."""
+    """Generate a fictional hotel dataset (PMS + CRM + a flat DWH extract) and load, profile, relate and analyse it – ready to explore."""
     from . import demo as demo_mod
     typer.echo(f"Generating demo data (scale {scale})…")
     counts = demo_mod.generate(out, scale=scale, echo=typer.echo)
     typer.echo("  " + ", ".join(f"{k} {v:,}" for k, v in counts.items()))
     if files_only:
-        typer.secho(f"Done. Load it with: uv run bearings load {out}/exports/pms -s pms && uv run bearings load {out}/exports/crm -s crm", fg="green")
+        typer.secho(f"Done. Load it with: uv run bearings load {out}/exports/pms -s pms && uv run bearings load {out}/exports/crm -s crm"
+                    f" && uv run bearings load {out}/exports/dwh -s dwh", fg="green")
         return
     dbp = Path(db).resolve()
     if dbp.exists():
         dbp.unlink()
     con = _rw(dbp)
-    for src in ("pms", "crm"):
+    for src in ("pms", "crm", "dwh"):
         loader.load(con, out / "exports" / src, schema=src, echo=typer.echo)
     loader.load_comments(con, out / "comments.csv", echo=typer.echo)
     for s, t in user_tables(con):
@@ -334,6 +463,8 @@ def demo(out: Path = typer.Option(Path("demo"), "--out", "-o", help="Folder for 
     rels = relationships.discover(con, deep=True, echo=lambda *_: None)
     relationships.save(con, rels)
     typer.echo(f"  ✓ {len(rels)} relationships found")
+    done, _ = insights.run_many(con, insights.targets(con))
+    typer.echo(f"  ✓ modelling insights for {len(done)} tables (grain, time coverage, dependencies)")
     con.close()
     typer.secho(f"\nReady. Start the app on the demo database:\n  uv run bearings serve --db {db}\n", fg="green")
 
@@ -693,6 +824,11 @@ def connect_cmd(host: Optional[str] = typer.Option(None, "--host", help="Workspa
         res = rpull.cache(dbp, aliases=aliases, max_rows=pull_max_rows, echo=typer.echo)
         ok = [r for r in res if "error" not in r]
         typer.echo(f"  {sum(1 for r in ok if r.get('complete'))} cached whole, {sum(1 for r in ok if not r.get('complete'))} as a sample")
+        con = _rw(dbp)
+        relationships.refresh_cardinality(con, set(aliases))
+        done, _ = insights.run_many(con, insights.targets(con, set(aliases)))
+        con.close()
+        typer.echo(f"  ✓ modelling insights for {len(done)} cached table(s): bearings insights -s {aliases[0]} --show")
     else:
         typer.echo("  skipped – cache later with: bearings cache -s " + " -s ".join(aliases) + " --max-rows 300000")
     typer.secho(f"\nReady. Start the app with:  uv run bearings serve\nKeep it current later with:  uv run bearings refresh", fg="green")
@@ -739,6 +875,8 @@ def refresh(schema: Optional[List[str]] = typer.Option(None, "--schema", "-s", h
     con = _rw(dbp)
     rels = relationships.discover(con, deep=True, echo=lambda *_: None, schemas=set(aliases))
     relationships.save(con, rels, schemas=set(aliases))
+    typer.secho("Modelling insights (cached tables)", bold=True)
+    insights.run_many(con, insights.targets(con, set(aliases)))
     con.close()
     typer.secho(f"Done: {len(changed)} schema change(s), {len(moved)} table(s) with new data, {len(targets)} re-profiled, "
                 f"{len(stale_cached)} re-cached, {len(rels)} relationships.", fg="green")

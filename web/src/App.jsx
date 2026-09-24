@@ -7,6 +7,7 @@ import ProfileDrawer from './components/ProfileDrawer.jsx'
 import { ColumnPane, TablePane } from './components/Results.jsx'
 import TableDetail from './components/TableDetail.jsx'
 import { AnnotationsView, RelationshipsView, SqlView } from './components/Views.jsx'
+import CodeListsView from './components/CodeLists.jsx'
 import LookupResults from './components/Lookup.jsx'
 
 // `column op value`, e.g. reservationid=9401, guest_code = G1,G2, arrival_date >= 2026-01-01, email ~ gmail
@@ -191,7 +192,7 @@ export default function App() {
     return () => clearTimeout(h)
   }, [selKey]) // eslint-disable-line
 
-  // keyboard: ↑/↓ tables, ⇧↑/⇧↓ matched columns, x tick, 1-4 tabs, s sample, a add data, ? help, ⌘/Ctrl+K jump
+  // keyboard: ↑/↓ tables, ⇧↑/⇧↓ matched columns, x tick, 1-6 tabs, s sample, a add data, ? help, ⌘/Ctrl+K jump
   const matchedCols = useMemo(() => (results?.tables || []).flatMap((r) => (r.matched_columns || []).map((c) => ({ r, c }))), [results])
   useEffect(() => {
     const h = (e) => {
@@ -216,7 +217,7 @@ export default function App() {
         if (!list.length) return
         const at = list.findIndex((t) => `${t.schema}.${t.table}` === selKey)
         const nx = list[at === -1 ? 0 : Math.max(0, Math.min(list.length - 1, at + d))]
-        openTable(nx.schema, nx.table, nx.matched_columns?.[0]?.column || null, tab === 'profile' || tab === 'sample' || tab === 'rels' ? tab : 'columns')
+        openTable(nx.schema, nx.table, nx.matched_columns?.[0]?.column || null, ['profile', 'sample', 'rels', 'insights', 'quality'].includes(tab) ? tab : 'columns')
       }
       switch (e.key) {
         case 'ArrowDown': e.preventDefault(); move(1); break
@@ -225,7 +226,7 @@ export default function App() {
           if (inSearch && q) { setQ(''); setResults(null); setPanel('detail') } else if (panel === 'lookup') { setPanel('detail') } else { inputRef.current?.blur() }
           break
         case 'x': if (selKey) { const n = new Set(checked); n.has(selKey) ? n.delete(selKey) : n.add(selKey); setChecked(n) } break
-        case '1': case '2': case '3': case '4': if (sel) { setPanel('detail'); setTab(['columns', 'sample', 'profile', 'rels'][Number(e.key) - 1]) } break
+        case '1': case '2': case '3': case '4': case '5': case '6': if (sel) { setPanel('detail'); setTab(['columns', 'sample', 'profile', 'rels', 'insights', 'quality'][Number(e.key) - 1]) } break
         case 's': if (sel) { setPanel('detail'); setTab('sample') } break
         default:
       }
@@ -263,10 +264,10 @@ export default function App() {
       <header className="top">
         <div className="brand" title="Bearings — an open-source project by Flyingbear">
           <span className="brand-name">Bearings</span>
-          <span className="brand-by">by Flyingbear</span>
+          <span className="brand-by">by Flyingbear{stats?.version ? <span className="brand-ver" title={`Bearings version ${stats.version}`}> · v{stats.version}</span> : null}</span>
         </div>
         <nav className="tabs">
-          {[['explore', 'Explore'], ['rels', 'Relationships'], ['ann', 'Annotations'], ['sql', 'SQL']].map(([k, l]) => (
+          {[['explore', 'Explore'], ['rels', 'Relationships'], ['codes', 'Code lists'], ['ann', 'Annotations'], ['sql', 'SQL']].map(([k, l]) => (
             <button key={k} className={view === k ? 'active' : ''} onClick={() => setView(k)}>{l}</button>
           ))}
         </nav>
@@ -338,7 +339,8 @@ export default function App() {
           )}
         </>
       )}
-      {view === 'rels' && <RelationshipsView onOpenTable={openTable} scope={scopeParam} />}
+      {view === 'rels' && <RelationshipsView onOpenTable={openTable} scope={scopeParam} onOpenSql={(s) => { setSql(s); setView('sql') }} />}
+      {view === 'codes' && <CodeListsView onOpenTable={openTable} scope={scopeParam} />}
       {view === 'ann' && <AnnotationsView onOpenTable={openTable} refreshKey={refreshKey} scope={scopeParam} />}
       {view === 'sql' && <SqlView sql={sql} setSql={setSql} tables={allTables} />}
 

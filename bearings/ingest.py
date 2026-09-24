@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from . import loader, profiler, relationships
+from . import insights, loader, profiler, relationships
 from .db import connect, safe_name
 from .loaders import LoadOptions, readers
 
@@ -107,9 +107,10 @@ def listdir(path: str | None) -> dict:
 
 def run(db_path: Path, path: Path, schema: str, opts: LoadOptions | None = None, mode: str = "replace",
         tables: list[str] | None = None, comments: list[str] | None = None, profile: bool = True, relate: bool = True,
-        progress: Callable[[dict], None] = lambda _: None) -> dict:
+        analyse: bool = True, progress: Callable[[dict], None] = lambda _: None) -> dict:
     """Load the tables at `path` into `schema` (only `tables` when given), import description files, profile what
-    was loaded and look for relationships touching the schema. `progress` gets {phase, current, done, total}."""
+    was loaded, look for relationships touching the schema and compute modelling insights (grain, time coverage,
+    dependencies). `progress` gets {phase, current, done, total}."""
     opts = opts or LoadOptions()
     t0 = time.time()
     schema = safe_name(schema) if schema and schema != "main" else "main"
@@ -166,9 +167,21 @@ def run(db_path: Path, path: Path, schema: str, opts: LoadOptions | None = None,
             errors.append({"table": schema, "error": f"relationships: {str(e).splitlines()[0]}"})
         finally:
             con.close()
+    analysed = 0
+    if analyse and profiled:
+        for i, t in enumerate(profiled):
+            progress({"phase": "insights", "current": f"{schema}.{t}", "done": i, "total": len(profiled)})
+            con = connect(db_path, read_only=False, retries=10)
+            try:
+                insights.run(con, schema, t)
+                analysed += 1
+            except Exception as e:
+                errors.append({"table": t, "error": f"insights: {str(e).splitlines()[0]}"})
+            finally:
+                con.close()
     progress({"phase": "done", "current": None, "done": total, "total": total})
     return {"schema": schema, "loaded": loaded, "errors": errors, "comments": n_comments, "profiled": len(profiled),
-            "relationships": len(rels), "seconds": round(time.time() - t0, 1)}
+            "relationships": len(rels), "analysed": analysed, "seconds": round(time.time() - t0, 1)}
 
 
 def _load_kw(opts: LoadOptions) -> dict:

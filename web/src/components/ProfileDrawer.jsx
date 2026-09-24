@@ -11,6 +11,9 @@ export default function ProfileDrawer({ target, onClose, onValueSearch, onOpenTa
   const [rels, setRels] = useState([])
   const [ann, setAnn] = useState({ tags: '', cdm_entity: '', cdm_attribute: '', notes: '' })
   const [saved, setSaved] = useState(null)
+  const [byCols, setByCols] = useState([])
+  const [by, setBy] = useState('')
+  const [bd, setBd] = useState(null)
 
   useEffect(() => {
     let off = false
@@ -24,6 +27,8 @@ export default function ProfileDrawer({ target, onClose, onValueSearch, onOpenTa
       const c = t.columns.find((x) => x.column === column)
       const a = c?.annotation || {}
       setAnn({ tags: a.tags || '', cdm_entity: a.cdm_entity || '', cdm_attribute: a.cdm_attribute || '', notes: a.notes || '' })
+      setByCols(t.columns.filter((x) => x.column !== column && x.profile && x.profile.distinct_count >= 2 && x.profile.distinct_count <= 50).map((x) => x.column))
+      setBy(''); setBd(null)
       setRels(t.relationships.filter((r) =>
         (r.from_table === table && r.from_column === column) || (r.to_table === table && r.to_column === column)))
     })
@@ -48,6 +53,14 @@ export default function ProfileDrawer({ target, onClose, onValueSearch, onOpenTa
     ['Nulls', `${fmt.n(p.null_count)} (${fmt.pct(p.null_pct)})`],
     ['Distinct', `${fmt.n(p.distinct_count)} (${fmt.pct(p.distinct_pct)})`],
     p.blank_count != null && ['Blank strings', fmt.n(p.blank_count)],
+    p.placeholder_count > 0 && ['Placeholder values', `${fmt.n(p.placeholder_count)} — ${(p.placeholder_values || []).map((x) => `${x.v === '' ? "''" : x.v} ×${fmt.n(x.n)}`).join(', ')}`],
+    p.effective_null_pct != null && p.effective_null_pct - p.null_pct >= 0.05 && ['Effectively empty', `${fmt.pct(p.effective_null_pct)} (nulls + blanks + placeholders)`],
+    p.type_hint && ['Type hint', `${p.type_hint.type} — ${(p.type_hint.share * 100).toFixed(1)}% of ${fmt.n(p.type_hint.checked)} values parse`
+      + (p.type_hint.formats ? ` (${Object.entries(p.type_hint.formats).map(([f, s]) => `${f} ${Math.round(s * 100)}%`).join(', ')})` : '')],
+    p.leading_zero_count > 0 && ['Leading zeros', `${fmt.n(p.leading_zero_count)} values (keep as text)`],
+    p.outlier_low != null && ['Typical range', `${fmt.n(p.outlier_low)} … ${fmt.n(p.outlier_high)} (3 × IQR)`],
+    p.outlier_count > 0 && ['Far-out values', `${fmt.n(p.outlier_count)} — e.g. ${(p.outlier_values || []).slice(0, 3).map((x) => fmt.n(x.v)).join(', ')}`],
+    p.negative_count > 0 && ['Negative values', fmt.n(p.negative_count)],
     ['Min', p.min_val], ['Max', p.max_val],
     p.mean != null && ['Mean', Number(p.mean).toLocaleString(undefined, { maximumFractionDigits: 4 })],
     p.stddev != null && ['Std dev', Number(p.stddev).toLocaleString(undefined, { maximumFractionDigits: 4 })],
@@ -79,6 +92,20 @@ export default function ProfileDrawer({ target, onClose, onValueSearch, onOpenTa
             <FreqList items={p.top_values} total={p.row_count} onPick={onValueSearch} mono />
             {p.patterns?.length > 0 && (<><h4>Patterns <span className="muted small">A=upper a=lower 9=digit</span></h4>
               <FreqList items={p.patterns} total={nn} labelKey="p" mono /></>)}
+          </>
+        )}
+        {byCols.length > 0 && (
+          <>
+            <h4>Break down by <select value={by} onChange={async (e) => {
+              const v = e.target.value; setBy(v); setBd(null)
+              if (v) { try { setBd(await api.breakdown(schema, table, column, v)) } catch (er) { setBd({ error: er.message }) } }
+            }}><option value="">another column…</option>{byCols.map((c) => <option key={c}>{c}</option>)}</select></h4>
+            {bd?.error && <div className="error">{bd.error}</div>}
+            {bd?.rows && (
+              <table className="grid ins-time small"><thead><tr><th>{by}</th><th className="r">Rows</th><th className="r">Filled %</th><th className="r">Distinct</th><th>Most common</th></tr></thead>
+                <tbody>{bd.rows.map((x, i) => <tr key={i}><td className="mono">{x[0] ?? '(empty)'}</td><td className="r">{fmt.n(x[1])}</td><td className="r">{fmt.pct(x[3])}</td>
+                  <td className="r">{fmt.n(x[4])}</td><td className="mono">{x[5] ?? ''}</td></tr>)}</tbody></table>
+            )}
           </>
         )}
         <h4>Relationships</h4>
