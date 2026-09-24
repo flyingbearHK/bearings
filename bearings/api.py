@@ -240,15 +240,19 @@ def sample(schema: str, table: str, n: int = 20, columns: str | None = None, non
                 raise HTTPException(400, "Only a simple filter expression is allowed")
             conds.append(f"({where})")
         wh = f"WHERE {' AND '.join(conds)}" if conds else ""
-        seed_sql = f" REPEATABLE ({int(seed)})" if seed is not None else ""
-        sql = f"SELECT {', '.join(qi(c) for c in cols)} FROM {fq(schema, table)} {wh} USING SAMPLE {n} ROWS (reservoir){seed_sql}"
+        method = f"(reservoir, {int(seed)})" if seed is not None else "(reservoir)"
+        sel = ', '.join(qi(c) for c in cols)
+        # USING SAMPLE runs before WHERE in the same SELECT, so filter first and sample what matches
+        sql = (f"SELECT {sel} FROM (SELECT {sel} FROM {fq(schema, table)} {wh}) AS matched USING SAMPLE {n} ROWS {method}"
+               if conds else f"SELECT {sel} FROM {fq(schema, table)} USING SAMPLE {n} ROWS {method}")
         try:
-            cur = con.execute(sql)
+            rows = con.execute(sql).fetchall()
+            matched = con.execute(f"SELECT count(*) FROM {fq(schema, table)} {wh}").fetchone()[0] if conds else None
         except Exception as e:
             raise HTTPException(400, str(e).split("\n")[0])
-        rows = cur.fetchall()
         types = {c["column"]: c["type"] for c in tb["columns"]}
-    return jsonable({"columns": cols, "types": [types[c] for c in cols], "rows": rows, "sql": sql, **_source(tb, False)})
+    return jsonable({"columns": cols, "types": [types[c] for c in cols], "rows": rows, "sql": sql, "matched": matched,
+                     **_source(tb, False)})
 
 
 @app.get("/api/table/{schema}/{table}/profile")
@@ -546,10 +550,10 @@ def insight_exceptions(schema: str, table: str, determinant: str, dependent: str
 def _run_insights_job(job_id: str, targets: list[tuple[str, str]], only: set[str] | None):
     job = _jobs[job_id]
     for s_, t in targets:
-        job["current"] = f"{s_}.{t}"
+        job["current"], job["step"] = f"{s_}.{t}", None
         con = connect(DB, read_only=False, retries=10)
         try:
-            r = insights.run(con, s_, t, only=only)
+            r = insights.run(con, s_, t, only=only, progress=lambda step: job.update(step=step))
             job["results"].append({"table": f"{s_}.{t}", "seconds": r["seconds"], "on_sample": r["on_sample"]})
         except Exception as e:  # noqa: BLE001
             job["errors"].append({"table": f"{s_}.{t}", "error": str(e).splitlines()[0] if str(e) else type(e).__name__})
@@ -557,20 +561,24 @@ def _run_insights_job(job_id: str, targets: list[tuple[str, str]], only: set[str
             con.close()
         job["done"] = len(job["results"]) + len(job["errors"])
     catalog._cache["key"] = None
-    job.update(status="failed" if job["errors"] and not job["results"] else "done", current=None,
+    job.update(status="failed" if job["errors"] and not job["results"] else "done", current=None, step=None,
                finished_at=dt.datetime.now().isoformat(timespec="seconds"))
 
 
 @app.post("/api/insights")
 def run_insights(body: dict = Body(default={})):
     """Compute modelling insights for local / cached tables (background job unless wait=true).
-    body = {tables?: ["schema.table"], schemas?: [...], only?: ["grain","time","deps"], wait?: bool}"""
+    body = {tables?: ["schema.table"], schemas?: [...], only?: ["grain","time","deps"], missing?: bool, wait?: bool}
+    missing: only tables without insights, or profiled again since they were computed"""
     only = set(body.get("only") or []) or None
     if only and only - set(insights.KINDS):
         raise HTTPException(400, f"only takes {', '.join(insights.KINDS)}")
     with ro(DB) as con:
-        targets = insights.targets(con, set(body.get("schemas") or []) or None, body.get("tables") or None)
+        targets = insights.targets(con, set(body.get("schemas") or []) or None, body.get("tables") or None,
+                                   missing=bool(body.get("missing")))
     if not targets:
+        if body.get("missing"):
+            raise HTTPException(400, "Every profiled local table in scope already has up-to-date insights")
         raise HTTPException(400, "Nothing to analyse: profile the table first (remote tables need a local copy – ⤓ Cache locally)")
     with _jobs_lock:
         job_id = uuid.uuid4().hex[:12]
@@ -1215,7 +1223,8 @@ def remote_warm_status():
 
 
 def _warehouse_connections(only: str | None) -> list[str]:
-    if not _remote_enabled() or not DB.exists():
+    # connections behind attached remote schemas; a connector without its extra reports that as a warm-up error
+    if not DB.exists():
         return []
     from .remote import connections as cx
     with ro(DB) as con:

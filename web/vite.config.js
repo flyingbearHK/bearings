@@ -6,5 +6,6 @@ import react from '@vitejs/plugin-react'
 export default defineConfig({
   plugins: [react()],
   server: { proxy: { '/api': 'http://127.0.0.1:8765' } },
-  build: { outDir: '../bearings/static', emptyOutDir: true },
+  // the app itself is ~300 kB; the big chunks are Mermaid's diagram renderers, loaded only when the ER diagram opens
+  build: { outDir: '../bearings/static', emptyOutDir: true, chunkSizeWarningLimit: 2500 },
 })

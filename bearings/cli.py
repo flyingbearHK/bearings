@@ -174,8 +174,9 @@ def relate(min_overlap: float = typer.Option(0.5, help="Minimum share of FK valu
 @app.command("insights")
 def insights_cmd(table: Optional[List[str]] = typer.Option(None, "--table", "-t", help="schema.table (repeatable). Default: all profiled local / cached tables"),
                  only: Optional[str] = typer.Option(None, "--only", help="Comma-separated subset: grain,time,deps,codes,optional"),
-                 sample_rows: int = typer.Option(insights.DEFAULT_SAMPLE, "--sample-rows", help="Scan a random sample of N rows of bigger tables"),
+                 sample_rows: int = typer.Option(insights.DEFAULT_SAMPLE, "--sample-rows", help="Scan a random sample of up to N rows of bigger tables (wide tables get fewer, min 200,000)"),
                  show: bool = typer.Option(False, "--show", help="Print candidate entities, hierarchies and dirty dependencies"),
+                 missing: bool = typer.Option(False, "--missing", help="Only tables without insights, or profiled again since"),
                  schema: Optional[List[str]] = SchemaOpt,
                  db: Optional[Path] = DbOpt):
     """Modelling insights: the grain of each table, time coverage of its date columns, and dependencies between columns
@@ -187,9 +188,9 @@ def insights_cmd(table: Optional[List[str]] = typer.Option(None, "--table", "-t"
         raise typer.Exit(1)
     dbp = _db(db)
     con = _rw(dbp)
-    tabs = insights.targets(con, set(schema) if schema else None, table)
+    tabs = insights.targets(con, set(schema) if schema else None, table, missing=missing)
     if not tabs:
-        typer.echo("Nothing to analyse (profile the tables first: bearings profile).")
+        typer.echo("Nothing to analyse" + (": every profiled table has up-to-date insights." if missing else " (profile the tables first: bearings profile)."))
         con.close()
         return
     t0 = time.time()

@@ -22,6 +22,10 @@ from . import codes
 from .profiler import DATEISH_NAME, KEYISH_NAME, PLACEHOLDERS, _sql_list, family, load_profile
 
 DEFAULT_SAMPLE = 1_000_000      # rows scanned per table; bigger tables are sampled (reservoir, fixed seed)
+SAMPLE_CELLS = 30_000_000       # …and wide tables get fewer rows (rows × columns), so the sample stays in memory
+MIN_SAMPLE = 200_000            # never fewer rows than this (unless asked for), however wide the table
+FULL_SCAN_MAX = 20_000_000      # time coverage and code lists (one column at a time) read the whole table up to this size,
+                                # so a date or code filled on a handful of rows isn't missed by the sample
 FD_MIN_STRENGTH = 0.98          # share of rows that must agree with their group's majority value
 GRAIN_MAX_COLS = 8              # candidate columns for the grain search (pairs, then triples)
 NEAR_GRAIN = 0.999              # report a "grain with duplicates" when no combination is fully unique
@@ -30,6 +34,7 @@ KINDS = ("grain", "time", "deps", "codes", "optional")
 COND_MAX_VALUES = 20            # a column that explains when another is filled has at most this many values
 GROUP_SIMILARITY = 0.95         # columns filled on (almost) the same rows form an optional group
 SAMPLE_TABLE = "__bearings_insights_sample"
+FILLED_TABLE = "__bearings_insights_filled"
 
 MEASURE_TYPE = re.compile(r"^(FLOAT|DOUBLE|REAL|DECIMAL|NUMERIC)", re.I)
 PRIMARY_DATE = ["business_date", "posting", "arrival", "transaction", "txn", "order", "booking", "stay", "sale",
@@ -190,14 +195,16 @@ def time_coverage(con, src: str, cols: list[dict]) -> list[dict]:
 
 
 # ------------------------------------------------------------------ F5 dependencies
-def dependencies(con, src: str, cols: list[dict], min_strength: float = FD_MIN_STRENGTH) -> list[dict]:
+def dependencies(con, src: str, cols: list[dict], min_strength: float = FD_MIN_STRENGTH, progress=lambda *_: None) -> list[dict]:
     """X → Y with row-based strength: the share of rows whose Y equals the most common Y for their X. One
     GROUPING SETS query per determinant scores all its candidate dependents."""
     usable = [c for c in cols if c["fam"] != "other" and not {"all_null", "constant"} & c["flags"] and not _long_text(c)]
     dets = [c for c in usable if 2 <= c["d"] <= c["nn"] / 2 and c["fam"] not in ("temporal", "bool") and not _is_measure(c)]
     dets.sort(key=lambda c: (not _keyish(c["c"]), -c["d"]))
     out = []
-    for x in dets[:MAX_DETERMINANTS]:
+    dets = dets[:MAX_DETERMINANTS]
+    for i, x in enumerate(dets):
+        progress(f"dependencies {i + 1}/{len(dets)}")
         ys = [y for y in usable if y is not x and y["d"] > 1 and not _is_measure(y) and y["top_share"] < 0.95
               and y["d"] <= max(2 * x["d"], x["d"] + 20)]
         ys.sort(key=lambda y: (not _keyish(y["c"]), y["d"]))
@@ -395,14 +402,29 @@ def optional_attributes(con, src: str, prof: dict) -> tuple[list[dict], list[dic
     cand = _optional_candidates(prof)
     if not cand:
         return [], []
-    fx = {p["column_name"]: filled_expr(p["column_name"], p["data_type"]) for p in cand}
-    names = list(fx)
+    names = [p["column_name"] for p in cand]
+    explainers = sorted([p for p in prof.values() if codes.is_code(p) and (p.get("distinct_count") or 0) <= COND_MAX_VALUES],
+                        key=lambda p: p.get("distinct_count") or 0)[:15]
+    # "is filled" is evaluated once per row and column into a narrow table of booleans (f0, f1, …) next to the explaining
+    # code columns (e0, e1, …); the ~800 pair counts and the per-code counts below then only read booleans
+    sel = [f"{filled_expr(p['column_name'], p['data_type'])} AS f{i}" for i, p in enumerate(cand)]
+    sel += [f"CAST({qi(y['column_name'])} AS VARCHAR) AS e{j}" for j, y in enumerate(explainers)]
+    ft = f"temp.main.{FILLED_TABLE}"
+    con.execute(f"CREATE OR REPLACE TEMP TABLE {FILLED_TABLE} AS SELECT {', '.join(sel)} FROM {src}")
+    try:
+        return _optional_from_flags(con, ft, names, explainers)
+    finally:
+        con.execute(f"DROP TABLE IF EXISTS {ft}")
+
+
+def _optional_from_flags(con, ft: str, names: list[str], explainers: list[dict]) -> tuple[list[dict], list[dict]]:
+    fx = {c: f"f{i}" for i, c in enumerate(names)}
     # --- groups: pairwise overlap of the filled rows
     groups = []
     if len(names) >= 2:
         pairs = [(a, b) for i, a in enumerate(names) for b in names[i + 1:]][:780]
         aggs = [f"count(*) FILTER (WHERE {fx[c]})" for c in names] + [f"count(*) FILTER (WHERE {fx[a]} AND {fx[b]})" for a, b in pairs]
-        r = con.execute(f"SELECT count(*), {', '.join(aggs)} FROM {src}").fetchone()
+        r = con.execute(f"SELECT count(*), {', '.join(aggs)} FROM {ft}").fetchone()
         total, filled = r[0], dict(zip(names, r[1:1 + len(names)]))
         both = dict(zip(pairs, r[1 + len(names):]))
         parent = {c: c for c in names}
@@ -427,16 +449,14 @@ def optional_attributes(con, src: str, prof: dict) -> tuple[list[dict], list[dic
             sim = min(jac.get((a, b), jac.get((b, a), 1)) for i, a in enumerate(ms) for b in ms[i + 1:])
             groups.append({"columns": ms, "filled_rows": min(filled[c] for c in ms), "row_count": total, "similarity": round(sim, 4)})
     # --- conditional rules: one GROUP BY per explaining column
-    explainers = sorted([p for p in prof.values() if codes.is_code(p) and (p.get("distinct_count") or 0) <= COND_MAX_VALUES],
-                        key=lambda p: p.get("distinct_count") or 0)[:15]
     best: dict = {}
-    for y in explainers:
+    for j, y in enumerate(explainers):
         yc = y["column_name"]
         xs = [c for c in names if c != yc]
         if not xs:
             continue
-        rows = con.execute(f"SELECT CAST({qi(yc)} AS VARCHAR), count(*), {', '.join(f'count(*) FILTER (WHERE {fx[c]})' for c in xs)} "
-                           f"FROM {src} GROUP BY 1").fetchall()
+        rows = con.execute(f"SELECT e{j}, count(*), {', '.join(f'count(*) FILTER (WHERE {fx[c]})' for c in xs)} "
+                           f"FROM {ft} GROUP BY 1").fetchall()
         total = sum(r[1] for r in rows)
         for i, x in enumerate(xs):
             filled_all = sum(r[2 + i] for r in rows)
@@ -451,7 +471,7 @@ def optional_attributes(con, src: str, prof: dict) -> tuple[list[dict], list[dic
                 continue
             score = precision * coverage - 0.01 * len(s_rows)
             if x not in best or score > best[x]["score"]:
-                best[x] = {"column_name": x, "by_column": yc, "when_values": sorted(r[0] if r[0] is not None else None for r in s_rows),
+                best[x] = {"column_name": x, "by_column": yc, "when_values": sorted((r[0] for r in s_rows), key=lambda v: (v is None, v or "")),
                            "precision": round(precision, 4), "coverage": round(coverage, 4), "filled_rows": filled_all,
                            "rows_when": rows_s, "score": score}
     return list(best.values()), groups
@@ -490,8 +510,17 @@ def optional_view(con, schema: str, table: str) -> dict:
 
 
 # ------------------------------------------------------------------ run / save / read
-def run(con, schema: str, table: str, sample_rows: int | None = DEFAULT_SAMPLE, only: set[str] | None = None) -> dict:
-    """Compute and store insights for one local (or cached) table. `con` must be writable."""
+def sample_size(n_cols: int, sample_rows: int | None) -> int | None:
+    """Rows to scan: `sample_rows`, fewer for wide tables (SAMPLE_CELLS), but not below MIN_SAMPLE."""
+    if not sample_rows:
+        return None
+    return max(min(sample_rows, SAMPLE_CELLS // max(n_cols, 1)), min(sample_rows, MIN_SAMPLE))
+
+
+def run(con, schema: str, table: str, sample_rows: int | None = DEFAULT_SAMPLE, only: set[str] | None = None,
+        progress=lambda *_: None) -> dict:
+    """Compute and store insights for one local (or cached) table. `con` must be writable.
+    `progress(step)` is called before each step (for the app's job status)."""
     only = set(only or KINDS)
     tp, prof = load_profile(con, schema, table)
     if not tp or not prof:
@@ -501,24 +530,40 @@ def run(con, schema: str, table: str, sample_rows: int | None = DEFAULT_SAMPLE, 
     n_full = con.execute(f"SELECT count(*) FROM {full}").fetchone()[0]
     src, n = full, n_full
     t0 = time.time()
-    if sample_rows and n_full > sample_rows:
-        con.execute(f"CREATE OR REPLACE TEMP TABLE {SAMPLE_TABLE} AS SELECT * FROM {full} USING SAMPLE {int(sample_rows)} ROWS (reservoir, 42)")
-        src, n = f"temp.main.{SAMPLE_TABLE}", int(sample_rows)
+    # only the columns the steps below can use go into the sample (not binary / nested / empty ones)
+    table_cols = {r[0] for r in con.execute("SELECT column_name FROM duckdb_columns() WHERE schema_name=? AND table_name=? "
+                                            "AND database_name=current_database()", [schema, table]).fetchall()}
+    keep = [c["c"] for c in cols if c["c"] in table_cols and c["fam"] != "other" and "all_null" not in c["flags"]]
+    rows = sample_size(len(keep), sample_rows)
+    if rows and n_full > rows:
+        progress(f"sampling {rows:,} of {n_full:,} rows")
+        con.execute(f"CREATE OR REPLACE TEMP TABLE {SAMPLE_TABLE} AS SELECT {', '.join(qi(c) for c in keep)} FROM {full} "
+                    f"USING SAMPLE {int(rows)} ROWS (reservoir, 42)")
+        src, n = f"temp.main.{SAMPLE_TABLE}", int(rows)
+        cols = [c for c in cols if c["c"] in keep]
+        prof = {k: p for k, p in prof.items() if p["column_name"] in keep}
     from .relationships import sampled_tables
     cache_sample = (schema, table) in sampled_tables(con)
     on_sample = src != full or cache_sample
-    res: dict = {"schema": schema, "table": table, "rows": n_full, "scanned_rows": n, "on_sample": on_sample}
+    col_src = full if n_full <= FULL_SCAN_MAX else src
+    res: dict = {"schema": schema, "table": table, "rows": n_full, "scanned_rows": n, "on_sample": on_sample,
+                 "columns_on_sample": col_src != full or cache_sample}
     try:
         if "grain" in only and n:
+            progress("grain")
             res["grain"] = find_grain(con, src, n, cols, full_src=full)
         if "time" in only:
-            res["time"] = time_coverage(con, src, cols)
+            progress("time coverage")
+            res["time"] = time_coverage(con, col_src, cols)
         if "deps" in only and n:
-            res["dependencies"] = dependencies(con, src, cols)
+            res["dependencies"] = dependencies(con, src, cols, progress=progress)
         if "codes" in only:
-            res["codes"] = codes.capture(con, src, list(prof.values()))
+            progress("code lists")
+            res["codes"] = codes.capture(con, col_src, list(prof.values()))
         if "optional" in only and n:
+            progress("optional attributes")
             res["rules"], res["groups"] = optional_attributes(con, src, prof)
+        progress("saving")
     finally:
         if src != full:
             con.execute(f"DROP TABLE IF EXISTS temp.main.{SAMPLE_TABLE}")
@@ -544,7 +589,7 @@ def save(con, res: dict):
         if res["time"]:
             con.executemany(f"INSERT INTO {META}.time_profile (schema_name, table_name, {', '.join(keys)}, series, on_sample, profiled_at) "
                             f"VALUES ({', '.join('?' * (len(keys) + 5))})",
-                            [[s, t] + [x[k] for k in keys] + [json.dumps(x["series"]), res["on_sample"], now] for x in res["time"]])
+                            [[s, t] + [x[k] for k in keys] + [json.dumps(x["series"]), res.get("columns_on_sample", res["on_sample"]), now] for x in res["time"]])
     if "dependencies" in res:
         con.execute(f"DELETE FROM {META}.dependencies WHERE schema_name=? AND table_name=?", [s, t])
         keys = ["determinant", "dependent", "strength", "exceptions", "rows_checked", "determinant_distinct", "kind"]
@@ -559,7 +604,8 @@ def _save_more(con, res: dict, now):
     s, t = res["schema"], res["table"]
     if "codes" in res and has_meta(con, "code_values"):
         con.execute(f"DELETE FROM {META}.code_values WHERE schema_name=? AND table_name=?", [s, t])
-        rows = [[s, t, c, v, n, res["on_sample"]] for c, vals in res["codes"].items() for v, n in vals]
+        smp = res.get("columns_on_sample", res["on_sample"])
+        rows = [[s, t, c, v, n, smp] for c, vals in res["codes"].items() for v, n in vals]
         if rows:
             con.executemany(f"INSERT INTO {META}.code_values VALUES (?,?,?,?,?,?)", rows)
     if "rules" in res and has_meta(con, "conditional_fill"):
@@ -612,9 +658,11 @@ def exceptions_sql(schema: str, table: str, determinant: str, dependent: str, li
             f"WHERE g.rk > 1\nORDER BY t.{x}\nLIMIT {int(limit)}")
 
 
-def targets(con, schemas: set[str] | None = None, tables: list[str] | None = None) -> list[tuple[str, str]]:
-    """Local / cached tables that have a profile (optionally within schemas or a list of schema.table)."""
-    have = set(con.execute(f"SELECT schema_name, table_name FROM {META}.table_profile").fetchall())
+def targets(con, schemas: set[str] | None = None, tables: list[str] | None = None, missing: bool = False) -> list[tuple[str, str]]:
+    """Local / cached tables that have a profile (optionally within schemas or a list of schema.table).
+    missing: only those without insights, or profiled again since the insights were computed."""
+    stale = " WHERE insights_at IS NULL OR insights_at < profiled_at" if missing and available(con) else ""
+    have = set(con.execute(f"SELECT schema_name, table_name FROM {META}.table_profile{stale}").fetchall())
     out = [x for x in user_tables(con) if x in have]
     if schemas:
         out = [x for x in out if x[0] in schemas]

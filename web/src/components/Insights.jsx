@@ -27,6 +27,12 @@ export default function InsightsPanel({ t, workshop, onOpenSql, onOpenColumn, on
   const [keyRes, setKeyRes] = useState(null)
   const [msg, setMsg] = useState(null)
 
+  // reload when the "all tables" job in the header finishes
+  useEffect(() => {
+    const h = () => setReload((k) => k + 1)
+    window.addEventListener('bearings:insights-done', h)
+    return () => window.removeEventListener('bearings:insights-done', h)
+  }, [])
   useEffect(() => {
     let off = false
     setErr(null)
@@ -88,14 +94,16 @@ export default function InsightsPanel({ t, workshop, onOpenSql, onOpenColumn, on
   if (err && !d) return <div className="error">{err}</div>
   if (!d) return <div className="muted pad">Loading…</div>
   const running = job && job.status === 'running'
-  const runBtn = (label) => <button className="btn primary" onClick={run} disabled={!!running}>{running ? 'Analysing…' : label}</button>
+  const runBtn = (label) => <button className="btn primary" onClick={run} disabled={!!running}>{running ? `Analysing${job.step ? ` – ${job.step}` : ''}…` : label}</button>
   if (!d.profiled) return <div className="notice pad"><b>Not profiled yet.</b> Insights build on the column profile: run <code>bearings profile -t {t.schema}.{t.table}</code> first.</div>
   if (!d.computed_at) {
     return (
       <div className="notice pad">
         <b>No insights yet.</b> Find the grain, the time coverage of the date columns and the dependencies between columns (candidate entities, hierarchies,
         code ↔ description pairs). {runBtn('Compute insights')}
-        <div className="muted small">Or for everything: <code>bearings insights</code>. Takes about a second per table; big tables are sampled.</div>
+        <div className="muted small">Or for every table without insights:{' '}
+          <button className="link small" onClick={() => window.dispatchEvent(new CustomEvent('bearings:insights-all', { detail: { missing: true } }))}>compute them all</button>
+          {' '}(runs in the background, progress in the header; or <code>bearings insights --missing</code>). Takes a few seconds per table; big and wide tables are sampled.</div>
         {err && <div className="error">{err}</div>}
       </div>
     )
@@ -112,7 +120,7 @@ export default function InsightsPanel({ t, workshop, onOpenSql, onOpenColumn, on
         <span className="spacer" />
         {msg && <span className="good-text small">✓ {msg}</span>}
         {d.dismissed?.length > 0 && <button className="link small" onClick={unhideAll}>show {d.dismissed.length} hidden</button>}
-        <button className="btn" onClick={run} disabled={!!running} title="Recompute grain, time coverage and dependencies">{running ? 'Analysing…' : '↻ Re-run'}</button>
+        <button className="btn" onClick={run} disabled={!!running} title="Recompute grain, time coverage and dependencies">{running ? `Analysing${job.step ? ` – ${job.step}` : ''}…` : '↻ Re-run'}</button>
       </div>
       {err && <div className="error">{err}</div>}
 

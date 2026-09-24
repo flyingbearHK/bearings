@@ -12,6 +12,8 @@ Status: **Implemented in v0.4.0** (phases 1–3: F1–F5, ER diagram builder, co
 > - **Demo:** the hierarchy is shown with region and brand in `dwh.stay_flat` (room type → hotel → region / brand) instead of hotels sharing a country, so the coincidental `nationality_code → country_code` link stays in the demo.
 > - Also in v0.4.0: the version is shown next to "by Flyingbear", and samples are 30 / 200 rows.
 >
+> **v0.4.1** – large and wide tables: the insights sample is capped by cells (≤ 30 M, ≥ 200,000 rows) and holds only usable columns; time coverage and code lists scan the whole table (≤ 20 M rows); the app shows the running step and can compute insights for every table in scope (`--missing`); the sample filter selects from the whole table and reports the matching row count.
+>
 > **Phase 3 (also in v0.4.0)** – built, except profile history / drift (dropped: no use case):
 > - **ER diagram builder:** pick the entities (from the filtered relationships, or around one table 1–2 hops out), drawn in the app with Mermaid + the ELK layered layout (lines routed around the boxes), ↓ / → direction, and exports: `.mmd` (layout in the front matter), `.svg`, and an editable **draw.io** file with the same positions (`POST /api/erd` returns the entity/link model).
 > - **Code lists** (`bearings/codes.py`): columns with 2–200 values, all values captured by `insights` into `_meta.code_values`; similar lists by shared values (containment ≥ 50 %); value-by-value comparison with fuzzy suggestions; **Code lists** tab, Excel sheet.
@@ -42,7 +44,7 @@ Non-goals: generic statistical EDA (correlation matrices, pair plots, an embedde
 2. **Stored in `_meta`, shown where people already look.** Findings go into `_meta.*` tables. They then show up as flags, in the table header, on the Relationships tab, in the Excel report and in the Markdown specs, not in a separate "EDA" screen.
 3. **Suggestions, confirmed by a person.** Each finding is a hypothesis. Confirming it writes an annotation (tag, CDM entity or attribute, note), the same way the Relationships tab already asks people to review what discovery suggests.
 4. **Plain language for the room.** Every finding has a one-line sentence a business stakeholder can check, such as *"Each row is one CustomerId + Channel"*.
-5. **Bounded cost.** Hard caps on columns and combinations tested, sampling above `--sample-rows`, and nothing runs on a warehouse unless the user names the remote table (`-s`, `-t`, `--remote`). This matches remote profiling.
+5. **Bounded cost.** Hard caps on columns and combinations tested, sampling above `--sample-rows` (fewer rows for wide tables: at most 30 M cells, never below 200,000 rows; only the columns the steps can use are copied into the sample; time coverage and code lists read one column at a time, so they scan the whole table up to 20 M rows), and nothing runs on a warehouse unless the user names the remote table (`-s`, `-t`, `--remote`). This matches remote profiling.
 
 ## 3. Where it runs
 

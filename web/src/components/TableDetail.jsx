@@ -316,13 +316,16 @@ export function SamplePanel({ t, hl, workshop, n: n0 = SAMPLE_SIZES[0], only, re
         ]} />
         {hlCols.length > 0 && <label className="check"><input type="checkbox" checked={nonNull} onChange={(e) => setNonNull(e.target.checked)} /> non-null in matched</label>}
         <form className="where" onSubmit={(e) => { e.preventDefault(); setTick((x) => x + 1) }}>
-          <input placeholder="filter, e.g. status_code = 'CXL'" value={where} onChange={(e) => setWhere(e.target.value)} />
+          <input placeholder="filter the whole table, e.g. status_code = 'CXL' ⏎" value={where} onChange={(e) => setWhere(e.target.value)}
+            title="SQL condition on the whole table – the random rows are drawn from the rows that match. Press Enter to apply." />
         </form>
         {workshop && <label className="check"><input type="checkbox" checked={unmask} onChange={(e) => setUnmask(e.target.checked)} /> show PII</label>}
       </div>
       {err && <div className="error">{err}</div>}
       {res && <DataGrid columns={gridCols} rows={res.rows} empty="No rows match" dense filterable="Filter these rows…" hideEmptyToggle id="sample" highlight={term} />}
-      {res && <div className="muted small pad-x">{res.rows.length} random rows of {fmt.n(t.row_count)}{sourceNote(res) ? ` · ${sourceNote(res)}` : ''}{workshop && !unmask ? ' · PII columns masked' : ''}</div>}
+      {res && <div className="muted small pad-x">{res.matched != null
+          ? `${res.rows.length} random rows of the ${fmt.n(res.matched)} rows matching the filter`
+          : `${res.rows.length} random rows of ${fmt.n(t.row_count)}${/ WHERE /.test(res.sql || '') ? ' matching the filter' : ''}`}{sourceNote(res) ? ` · ${sourceNote(res)}` : ''}{workshop && !unmask ? ' · PII columns masked' : ''}</div>}
     </>
   )
 }
@@ -360,13 +363,16 @@ function ProfilePanel({ t, onOpenColumn, onReload }) {
   const withP = cols.filter((c) => c.profile)
   const flagCount = (f) => withP.filter((c) => c.profile.flags?.includes(f)).length
   const keys = live ? live.table.candidate_keys : tp.candidate_keys
+  // candidate keys can be long column names: last tile, stretched over whatever width is left on the row
   const tiles = [
     ['Rows', fmt.n(live ? live.table.row_count : tp.row_count)],
     ['Columns', withP.length],
-    ['Candidate keys', keys?.length ? keys.join(', ') : '—'],
     ['Avg null %', fmt.pct(withP.reduce((a, c) => a + c.profile.null_pct, 0) / (withP.length || 1))],
     ['All-null / constant', `${flagCount('all_null')} / ${flagCount('constant')}`],
     ['Possible PII', withP.filter((c) => c.profile.flags?.some((f) => f.startsWith('pii_'))).length],
+    ['Candidate keys', keys?.length
+      ? <span className="key-list">{keys.map((k) => <span key={k} className="mono" title={k}>{k}</span>)}</span>
+      : '—', 'wide'],
   ]
   const gridCols = [
     { key: 'column', label: 'Column', render: (c) => <span className="mono"><Hl text={c.column} /></span>, value: (c) => c.column },
@@ -381,7 +387,7 @@ function ProfilePanel({ t, onOpenColumn, onReload }) {
   return (
     <>
       <div className="tiles">
-        {tiles.map(([k, v]) => <div key={k} className="tile"><div className="muted small">{k}</div><div className="tile-v">{v}</div></div>)}
+        {tiles.map(([k, v, cls]) => <div key={k} className={`tile ${cls || ''}`}><div className="muted small">{k}</div><div className="tile-v">{v}</div></div>)}
       </div>
       <div className="muted small pad-x">
         {live ? `Computed live in ${live.elapsed_ms} ms (not saved)` : `Profiled ${tp.profiled_at?.slice(0, 16)}${tp.sampled_rows ? ` on a ${fmt.n(tp.sampled_rows)}-row sample` : ''}`} · click a column for full detail

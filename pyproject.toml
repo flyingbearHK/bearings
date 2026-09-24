@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bearings"
-version = "0.4.0"
+version = "0.4.1"
 description = "Get your bearings in unfamiliar source data: a local data-modelling workbench (DuckDB + web UI) for searching, profiling, sampling and relating CSV, Parquet, JSON and Excel exports or Databricks schemas."
 readme = "README.md"
 license = { text = "MIT" }

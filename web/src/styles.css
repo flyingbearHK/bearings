@@ -147,8 +147,11 @@ input:focus, select:focus, textarea:focus { outline: 2px solid var(--accent-soft
 .bar-fill.good { background: var(--good); }
 
 /* profile */
-.tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; padding: 12px; }
-.tile { border: 1px solid var(--border); border-radius: var(--radius); padding: 8px 12px; }
+.tiles { display: flex; flex-wrap: wrap; gap: 8px; padding: 12px; }
+.tile { flex: 1 1 130px; max-width: 200px; border: 1px solid var(--border); border-radius: var(--radius); padding: 8px 12px; }
+.tile.wide { flex: 1000 1 280px; max-width: none; }
+.tile.wide .tile-v { font-size: 1em; font-weight: 500; }
+.key-list { display: flex; flex-wrap: wrap; gap: 4px 14px; }
 .tile-v { font-size: 1.25em; font-weight: 600; font-variant-numeric: tabular-nums; word-break: break-word; }
 .card { margin: 12px; padding: 4px 0; border: 1px solid var(--border); border-radius: var(--radius); }
 .card h4 { margin: 8px 12px 0; }
@@ -414,3 +417,9 @@ tr.off td { opacity: .45; }
 .codes-page { flex-direction: row; overflow: hidden; }
 .modal-body > * { flex-shrink: 0; }
 @media (max-width: 1560px) { .top .stats-line { display: none; } }
+/* background job progress in the header (insights for all tables) */
+.job-pill { display: inline-flex; align-items: center; gap: 6px; max-width: 440px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: .85em; padding: 3px 10px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); border: 1px solid transparent; }
+button.job-pill { cursor: pointer; font: inherit; font-size: .85em; }
+.job-pill.ok { background: var(--good-soft); color: var(--good); }
+.job-pill.bad { background: var(--bad-soft); color: var(--bad); }

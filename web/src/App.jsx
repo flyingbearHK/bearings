@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { api, exportUrl, fmt, recent, store } from './api.js'
+import { api, exportUrl, fmt, recent, store, waitJob } from './api.js'
 import AddData, { filesFromDrop } from './components/AddData.jsx'
 import QuickOpen, { ShortcutHelp } from './components/QuickOpen.jsx'
 import ScopePicker from './components/ScopePicker.jsx'
@@ -116,6 +116,32 @@ export default function App() {
     window.addEventListener('drop', drop)
     return () => { window.removeEventListener('dragover', over); window.removeEventListener('dragleave', leave); window.removeEventListener('drop', drop) }
   }, [adding])
+
+  // modelling insights for every profiled table in scope (background job, progress pill in the header)
+  const [insJob, setInsJob] = useState(null)   // running job, or {finished: true, text}
+  const runAllInsights = useCallback(async (missing = true) => {
+    if (insJob && !insJob.finished) return
+    setError(null)
+    try {
+      const j0 = await api.runInsights({ schemas: scopeRef.current ? scopeRef.current.split(',') : undefined, missing })
+      setInsJob(j0)
+      const j = await waitJob(j0, setInsJob)
+      const errs = j.errors?.length ? ` · ${j.errors.length} failed (${j.errors[0].table}: ${j.errors[0].error})` : ''
+      setInsJob({ finished: true, failed: !!j.errors?.length, text: `✓ Insights computed for ${j.results.length} table${j.results.length === 1 ? '' : 's'}${errs}` })
+      loadMeta(); setRefreshKey((k) => k + 1)
+      window.dispatchEvent(new CustomEvent('bearings:insights-done'))
+    } catch (e) { setInsJob(null); setError(e.message) }
+  }, [insJob, loadMeta])
+  useEffect(() => {
+    const h = (e) => runAllInsights(e.detail?.missing ?? true)
+    window.addEventListener('bearings:insights-all', h)
+    return () => window.removeEventListener('bearings:insights-all', h)
+  }, [runAllInsights])
+  useEffect(() => {
+    if (!insJob?.finished || insJob.failed) return
+    const t = setTimeout(() => setInsJob(null), 10000)
+    return () => clearTimeout(t)
+  }, [insJob])
 
   const filter = mode === 'name' ? parseFilter(q) : null
   const effMatch = mode === 'value' && match === 'fuzzy' ? 'contains' : match
@@ -244,6 +270,8 @@ export default function App() {
     { label: 'Search values in the data', run: () => { setView('explore'); setMode('value'); setResults(null); setTimeout(() => inputRef.current?.focus()) } },
     { label: `${workshop ? 'Leave' : 'Enter'} workshop mode`, run: () => setWorkshop((w) => !w) },
     ...(scope.length ? [{ label: 'Show all schemas (clear scope)', run: () => setScope([]) }] : []),
+    { label: `Compute insights for tables without them${scope.length ? ' (in scope)' : ''}`, run: () => runAllInsights(true) },
+    { label: `Recompute insights for all profiled tables${scope.length ? ' (in scope)' : ''}`, run: () => runAllInsights(false) },
     { label: 'Export Excel mapping workbook', run: () => { window.location.href = exportUrl('xlsx', scopeParam) } },
     { label: 'Keyboard shortcuts', keys: '?', run: () => setHelp(true) },
   ]
@@ -275,6 +303,11 @@ export default function App() {
         <button className="btn jump" onClick={() => setPalette(true)} title="Jump to any table or column, or run an action">⌕ <span className="jump-label">Jump to…</span> <kbd>{MOD} K</kbd></button>
         <button className="btn" onClick={() => setAdding({})} title="Load CSV, Parquet, JSON or Excel files (or drop them anywhere) · a">＋ <span className="add-label">Add data</span></button>
         <ScopePicker schemas={stats?.schema_stats} scope={scope} setScope={setScope} onSynced={() => { loadMeta(); setRefreshKey((k) => k + 1); if (mode === 'name' && q.trim()) runSearch(q, 'name', match) }} />
+        {insJob && (insJob.finished
+          ? <button className={`job-pill ${insJob.failed ? 'bad' : 'ok'}`} onClick={() => setInsJob(null)} title="Dismiss">{insJob.text}</button>
+          : <span className="job-pill" title={insJob.tables?.join('\n')}>
+              <span className="spin">↻</span> Insights {insJob.done}/{insJob.total}{insJob.current ? ` · ${insJob.current}` : ''}{insJob.step ? ` · ${insJob.step}` : ''}
+            </span>)}
         {stats?.exists && <span className="muted small stats-line">{stats.tables} tables · {fmt.n(stats.columns)} columns · {stats.profiled} profiled · {stats.relationships} relationships</span>}
         <label className="check" title="Larger text; PII columns masked in samples"><input type="checkbox" checked={workshop} onChange={(e) => setWorkshop(e.target.checked)} /> Workshop mode</label>
         <a className="btn" href={exportUrl('xlsx', scopeParam)} title="Tables, columns, profile, annotations, relationships (current schema scope)">⤓ Excel</a>

@@ -186,3 +186,44 @@ def test_api(demo_db, con):
     md = c.get("/api/table/dwh/stay_flat/export.md").text
     assert "- Grain: one row per stay_id" in md and "## Candidate entities" in md and "Room type → Property → Region" in md
     assert c.get("/api/export/catalog.xlsx").status_code == 200
+
+
+def test_wide_tables_get_a_smaller_sample():
+    from bearings import insights
+    assert insights.sample_size(10, insights.DEFAULT_SAMPLE) == insights.DEFAULT_SAMPLE
+    assert insights.sample_size(144, insights.DEFAULT_SAMPLE) == insights.SAMPLE_CELLS // 144
+    assert insights.sample_size(2000, insights.DEFAULT_SAMPLE) == insights.MIN_SAMPLE
+    assert insights.sample_size(144, 500) == 500 and insights.sample_size(144, None) is None
+
+
+def test_optional_rule_with_empty_code_value():
+    """A fill rule whose code column includes NULL among its values (used to fail sorting None with strings)."""
+    from bearings import insights, profiler
+    c = duckdb.connect()
+    c.execute("""CREATE TABLE t AS SELECT i AS id, CASE WHEN i % 4 = 0 THEN NULL WHEN i % 4 = 1 THEN 'A' ELSE 'B' END AS kind,
+                 CASE WHEN i % 4 IN (0, 1) THEN 'v' || i END AS extra FROM range(4000) r(i)""")
+    _, cols = profiler.profile_table(c, "main", "t")
+    rules, _ = insights.optional_attributes(c, "t", {p["column_name"]: p for p in cols})
+    r = next(x for x in rules if x["column_name"] == "extra")
+    assert r["by_column"] == "kind" and r["when_values"] == ["A", None]
+
+
+def test_rare_dates_and_codes_read_the_whole_table(tmp_path):
+    """Time coverage and code lists scan the whole table, so a date filled on a handful of rows isn't lost to the sample."""
+    from bearings import insights, profiler
+    from bearings.db import connect
+    c = connect(tmp_path / "rare.duckdb")
+    c.execute("""CREATE SCHEMA s; CREATE TABLE s.t AS SELECT i AS id, 'k' || (i % 50) AS kind,
+                 DATE '2025-01-01' + (i % 300)::INT AS posting_date,
+                 CASE WHEN i IN (7, 70007) THEN DATE '2024-03-01' END AS rare_date FROM range(100000) r(i)""")
+    tp, cols = profiler.profile_table(c, "s", "t")
+    profiler.save(c, tp, cols)
+    r = insights.run(c, "s", "t", sample_rows=500)
+    assert r["on_sample"] and not r["columns_on_sample"]
+    assert "rare_date" in {x["column_name"] for x in r["time"]}
+    assert sum(n for _, n in r["codes"]["kind"]) == 100000
+    # --missing: nothing left to do, until the table is profiled again
+    assert insights.targets(c, {"s"}, missing=True) == []
+    c.execute("UPDATE _meta.table_profile SET profiled_at = insights_at + INTERVAL 1 MINUTE WHERE schema_name = 's'")
+    assert insights.targets(c, {"s"}, missing=True) == [("s", "t")]
+    c.close()
