@@ -25,3 +25,5 @@ web/node_modules/
 .databrickscfg
 .databricks/
 .bearings/
+build/
+dist/

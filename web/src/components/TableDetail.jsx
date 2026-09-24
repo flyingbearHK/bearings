@@ -1,8 +1,8 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
-import { STORAGE, ago, api, fmt, isPII, sourceNote, store } from '../api.js'
+import { STORAGE, ago, api, copy, fmt, isPII, sourceNote, store } from '../api.js'
 import { Bar, Flags, Tags } from './Charts.jsx'
 import ColumnPicker, { visibleKeys } from './ColumnPicker.jsx'
-import DataGrid, { Cell } from './DataGrid.jsx'
+import DataGrid, { Cell, Hl } from './DataGrid.jsx'
 import RemoteProfileButton, { PullButton, WarehouseState } from './RemoteProfile.jsx'
 
 const SCHEMA_FIELDS = [
@@ -15,7 +15,7 @@ const SCHEMA_FIELDS = [
 const SCHEMA_DEFAULT = { order: SCHEMA_FIELDS.map((f) => f.key), hidden: ['top', 'distinct_pct'] }
 
 export default function TableDetail({ schema, table, highlight, focusColumn, tab, setTab, onOpenColumn, onOpenTable,
-  workshop, onOpenSql, allTables, refreshKey, onPulled }) {
+  workshop, onOpenSql, allTables, refreshKey, onPulled, term }) {
   const [t, setT] = useState(null)
   const [err, setErr] = useState(null)
   const [selected, setSelected] = useState(new Set())
@@ -26,6 +26,10 @@ export default function TableDetail({ schema, table, highlight, focusColumn, tab
   const [req, setReq] = useState({ n: 20, only: null, id: 0 })
   const [reload, setReload] = useState(0)
   const [useRemote, setUseRemote] = useState(false)
+  const [matchedFirst, setMatchedFirst] = useState(() => store.get('matchedFirst', true))
+  const [hideNull, setHideNull] = useState(() => store.get('hideAllNull', false))
+  useEffect(() => store.set('matchedFirst', matchedFirst), [matchedFirst])
+  useEffect(() => store.set('hideAllNull', hideNull), [hideNull])
   const sampleRequest = (n, only = null) => { setReq((r) => ({ n, only, id: r.id + 1 })); setTab('sample') }
 
   useEffect(() => {
@@ -43,6 +47,8 @@ export default function TableDetail({ schema, table, highlight, focusColumn, tab
   if (!t || t.schema !== schema || t.table !== table) return <div className="detail"><div className="muted pad">Loading {schema}.{table}…</div></div>
 
   const tp = t.table_profile
+  const plat = t.remote?.platform || 'Databricks'
+  const compute = t.remote?.compute_label || 'SQL warehouse'
   const flagged = t.columns.filter((c) => c.profile?.flags?.length).length
   const toggleSel = (c) => { const s = new Set(selected); s.has(c) ? s.delete(c) : s.add(c); setSelected(s) }
 
@@ -52,7 +58,7 @@ export default function TableDetail({ schema, table, highlight, focusColumn, tab
       render: (c) => (
         <span className="colname" ref={c.column === focusColumn ? focusRef : undefined}>
           <input type="checkbox" checked={selected.has(c.column)} onClick={(e) => e.stopPropagation()} onChange={() => toggleSel(c.column)} title="Select for sample / key check" />
-          <span className="mono">{c.column}</span>
+          <span className="mono" title="Double-click to copy the name"><Hl text={c.column} term={hl.has(c.column) ? term : undefined} /></span>
           {tp?.candidate_keys?.includes(c.column) && <span className="chip good" title="Candidate key">PK?</span>}
           <button className="icon-btn small" title="Column profile" onClick={(e) => { e.stopPropagation(); onOpenColumn(c.column) }}>▤</button>
         </span>),
@@ -68,9 +74,13 @@ export default function TableDetail({ schema, table, highlight, focusColumn, tab
     flags: { render: (c) => <Flags flags={c.profile?.flags} />, value: (c) => (c.profile?.flags || []).join(',') },
     tags: { render: (c) => <Tags tags={c.annotation?.tags} />, value: (c) => c.annotation?.tags },
     cdm: { render: (c) => c.annotation?.cdm_entity ? <span className="mono small">{c.annotation.cdm_entity}{c.annotation.cdm_attribute ? '.' + c.annotation.cdm_attribute : ''}</span> : '', value: (c) => c.annotation?.cdm_entity },
-    comment: { render: (c) => <span className="comment" title={c.comment || ''}>{c.comment}</span>, value: (c) => c.comment },
+    comment: { render: (c) => <span className="comment" title={c.comment || ''}><Hl text={c.comment} /></span>, value: (c) => c.comment },
   }
   const schemaCols = visibleKeys(SCHEMA_FIELDS, schemaView).map((k) => ({ key: k, label: SCHEMA_FIELDS.find((f) => f.key === k).label, ...fieldRender[k] }))
+
+  const allNull = t.columns.filter((c) => c.profile?.flags?.includes('all_null')).length
+  let schemaRows = hideNull ? t.columns.filter((c) => !c.profile?.flags?.includes('all_null')) : t.columns
+  if (matchedFirst && hl.size) schemaRows = [...schemaRows.filter((c) => hl.has(c.column)), ...schemaRows.filter((c) => !hl.has(c.column))]
 
   const checkKey = async () => { setUniq({ loading: true }); try { setUniq(await api.uniqueness(schema, table, [...selected], useRemote)) } catch (e) { setUniq({ error: e.message }) } }
   const selectSql = `SELECT ${t.columns.map((c) => `"${c.column}"`).join(', ')}\nFROM "${schema}"."${table}"\nLIMIT 100`
@@ -85,10 +95,10 @@ export default function TableDetail({ schema, table, highlight, focusColumn, tab
         </div>
         {t.remote && (
           <div className={`remote-line ${t.kind === 'remote' ? 'meta-only' : ''}`}>
-            <span className="cloud">☁</span> Databricks <span className="mono">{t.remote.full_name}</span>
+            <span className="cloud">☁</span> {plat} <span className="mono">{t.remote.full_name}</span>
             <span className="muted small"> · {t.remote.connection} · synced {ago(t.remote.synced_at)}</span>
             {t.kind === 'remote'
-              ? <span className="small"> — rows stay in Databricks. Samples, key checks and lookups run live on the SQL warehouse (⚡).
+              ? <span className="small"> — rows stay in {plat}. Samples, key checks and lookups run live on the {compute} (⚡).
                   {t.table_profile ? ' Profile, relationships and value search use the cached profile and key values.' : ' Profile it to get stats, key detection and relationships.'}</span>
               : t.storage === 'sample'
                 ? <span className="small"> — <span className="chip warn">{STORAGE.sample.label}</span> {fmt.n(t.remote.cache?.rows)} of {fmt.n(t.remote.cache?.total)} rows cached {ago(t.remote.cache?.cached_at)}.
@@ -97,11 +107,11 @@ export default function TableDetail({ schema, table, highlight, focusColumn, tab
                     {t.table_profile?.stale ? ' The source has changed since – bearings refresh.' : ''}</span>}
             {t.kind === 'remote' && (
               <div className="remote-actions">
-                <RemoteProfileButton schema={schema} table={table} profiled={!!t.table_profile} stale={t.table_profile?.stale}
+                <RemoteProfileButton schema={schema} table={table} profiled={!!t.table_profile} stale={t.table_profile?.stale} platform={plat} compute={compute}
                   onDone={() => setReload((k) => k + 1)} />
                 <PullButton schema={schema} table={table} onDone={() => { setReload((k) => k + 1); onPulled?.() }} />
                 {t.table_profile && <span className="muted small">profiled {ago(t.table_profile.profiled_at)}{t.table_profile.sampled_rows ? ` · sample ${fmt.n(t.table_profile.sampled_rows)} rows for top values` : ' · whole table'}</span>}
-                <WarehouseState connection={t.remote.connection} />
+                <WarehouseState connection={t.remote.connection} compute={compute} />
               </div>
             )}
             {t.kind !== 'remote' && t.remote.cache && (
@@ -115,15 +125,15 @@ export default function TableDetail({ schema, table, highlight, focusColumn, tab
                     🔒 {t.remote.cache.masked.length} PII column{t.remote.cache.masked.length > 1 ? 's' : ''} masked</span>
                 )}
                 {t.remote.cache.outdated
-                  ? <span className="warn-text" title={`Cached at Delta version ${t.remote.cache.version}; Databricks is at ${t.remote.cache.latest_version} (checked ${ago(t.remote.cache.checked_at)})`}>
+                  ? <span className="warn-text" title={`Cached at ${t.remote.version_label || ''} version ${t.remote.cache.version}; ${plat} is at ${t.remote.cache.latest_version} (checked ${ago(t.remote.cache.checked_at)})`}>
                       ⚠ source data changed (v{t.remote.cache.version} → v{t.remote.cache.latest_version}) – re-cache</span>
-                  : t.remote.cache.version != null && <span className="muted" title={`Checked ${ago(t.remote.cache.checked_at)}`}>Delta v{t.remote.cache.version}</span>}
+                  : t.remote.cache.version != null && <span className="muted" title={`Checked ${ago(t.remote.cache.checked_at)}`}>{t.remote.version_label || 'version'} v{t.remote.cache.version}</span>}
               </div>
             )}
             {t.kind !== 'remote' && (
               <div className="remote-actions">
                 <PullButton schema={schema} table={table} cached onDone={() => { setReload((k) => k + 1); onPulled?.() }} />
-                <WarehouseState connection={t.remote.connection} />
+                <WarehouseState connection={t.remote.connection} compute={compute} />
               </div>
             )}
           </div>
@@ -138,7 +148,7 @@ export default function TableDetail({ schema, table, highlight, focusColumn, tab
           <span className="spacer" />
           {t.remote && (
             <label className={`check remote-toggle ${t.kind === 'remote' || useRemote ? 'on' : ''}`}
-              title={t.kind === 'remote' ? 'Not cached: sample and key check run on Databricks' : 'Run sample and key check on Databricks (whole table, slower) instead of the local cache'}>
+              title={t.kind === 'remote' ? `Not cached: sample and key check run on ${plat}` : `Run sample and key check on ${plat} (whole table, slower) instead of the local cache`}>
               <input type="checkbox" checked={t.kind === 'remote' || useRemote} disabled={t.kind === 'remote'} onChange={(e) => setUseRemote(e.target.checked)} /> ⚡ Remote
             </label>
           )}
@@ -167,6 +177,8 @@ export default function TableDetail({ schema, table, highlight, focusColumn, tab
                         { label: 'Default', apply: () => SCHEMA_DEFAULT }]} />
             {!tp && <span className="muted small">Not profiled — run <code>bearings profile -t {schema}.{table}</code> or open the Profile tab.</span>}
             {hl.size > 0 && <span className="muted small"><span className="hl-swatch" /> {[...hl].filter((c) => t.columns.some((x) => x.column === c)).length} matched</span>}
+            {hl.size > 0 && <label className="check small" title="Show the matched columns at the top"><input type="checkbox" checked={matchedFirst} onChange={(e) => setMatchedFirst(e.target.checked)} /> matched first</label>}
+            {allNull > 0 && <label className="check small" title="Hide columns that are always null (from the profile)"><input type="checkbox" checked={hideNull} onChange={(e) => setHideNull(e.target.checked)} /> hide {allNull} all-null</label>}
             <span className="spacer" />
             {selected.size > 0 && (
               <>
@@ -193,13 +205,14 @@ export default function TableDetail({ schema, table, highlight, focusColumn, tab
               <button className="icon-btn small" onClick={() => setUniq(null)}>✕</button>
             </div>
           )}
-          <DataGrid columns={schemaCols} rows={t.columns} rowKey={(c) => c.column}
+          <DataGrid columns={schemaCols} rows={schemaRows} rowKey={(c) => c.column} id="schema" filterable="Filter columns — name, type, tag, comment…"
+            toolbarExtra={<button className="link small" title="Copy all column names (one per line)" onClick={() => copy(schemaRows.map((c) => c.column).join('\n'), 'Column names copied')}>copy names</button>}
             rowClass={(c) => [hl.has(c.column) ? 'hl' : '', c.column === focusColumn ? 'focus' : ''].join(' ')}
             onRowClick={(c) => onOpenColumn(c.column)} />
         </>
       )}
 
-      {tab === 'sample' && <SamplePanel key={`${schema}.${table}.${req.id}`} t={t} hl={hl} workshop={workshop} n={req.n} only={req.only} remote={useRemote} />}
+      {tab === 'sample' && <SamplePanel key={`${schema}.${table}.${req.id}`} t={t} hl={hl} workshop={workshop} n={req.n} only={req.only} remote={useRemote} term={term} />}
       {tab === 'profile' && <ProfilePanel t={t} onOpenColumn={onOpenColumn} onReload={() => setReload((k) => k + 1)} />}
       {tab === 'rels' && <RelPanel t={t} allTables={allTables} onOpenTable={onOpenTable} />}
     </div>
@@ -207,7 +220,7 @@ export default function TableDetail({ schema, table, highlight, focusColumn, tab
 }
 
 /* ------------------------------------------------------------------ sample */
-export function SamplePanel({ t, hl, workshop, n: n0 = 20, only, remote = false }) {
+export function SamplePanel({ t, hl, workshop, n: n0 = 20, only, remote = false, term }) {
   const key = `sample:${t.schema}.${t.table}`
   const items = t.columns.map((c) => ({ key: c.column, label: c.column, hint: c.type.toLowerCase(), strong: hl.has(c.column) }))
   const [view, setView] = useState(() => {
@@ -257,7 +270,7 @@ export function SamplePanel({ t, hl, workshop, n: n0 = 20, only, remote = false 
         {workshop && <label className="check"><input type="checkbox" checked={unmask} onChange={(e) => setUnmask(e.target.checked)} /> show PII</label>}
       </div>
       {err && <div className="error">{err}</div>}
-      {res && <DataGrid columns={gridCols} rows={res.rows} empty="No rows match" dense />}
+      {res && <DataGrid columns={gridCols} rows={res.rows} empty="No rows match" dense filterable="Filter these rows…" hideEmptyToggle id="sample" highlight={term} />}
       {res && <div className="muted small pad-x">{res.rows.length} random rows of {fmt.n(t.row_count)}{sourceNote(res) ? ` · ${sourceNote(res)}` : ''}{workshop && !unmask ? ' · PII columns masked' : ''}</div>}
     </>
   )
@@ -278,9 +291,9 @@ function ProfilePanel({ t, onOpenColumn, onReload }) {
   if (!has && t.kind === 'remote') {
     return (
       <div className="notice pad">
-        <b>Not profiled yet.</b> The rows are in Databricks: profile the table on the SQL warehouse
+        <b>Not profiled yet.</b> The rows are in {t.remote?.platform || 'the remote source'}: profile the table on the {t.remote?.compute_label || 'remote engine'}
         (or <code>bearings profile -t {t.schema}.{t.table}</code>).
-        <div style={{ marginTop: 8 }}><RemoteProfileButton schema={t.schema} table={t.table} profiled={false} onDone={onReload} /></div>
+        <div style={{ marginTop: 8 }}><RemoteProfileButton schema={t.schema} table={t.table} profiled={false} onDone={onReload} platform={t.remote?.platform} compute={t.remote?.compute_label} /></div>
       </div>
     )
   }
@@ -305,8 +318,8 @@ function ProfilePanel({ t, onOpenColumn, onReload }) {
     ['Possible PII', withP.filter((c) => c.profile.flags?.some((f) => f.startsWith('pii_'))).length],
   ]
   const gridCols = [
-    { key: 'column', label: 'Column', render: (c) => <span className="mono">{c.column}</span>, value: (c) => c.column },
-    { key: 'type', label: 'Type', render: (c) => <span className="mono muted">{c.type}</span> },
+    { key: 'column', label: 'Column', render: (c) => <span className="mono"><Hl text={c.column} /></span>, value: (c) => c.column },
+    { key: 'type', label: 'Type', render: (c) => <span className="mono muted">{c.type}</span>, value: (c) => c.type },
     { key: 'null', label: 'Null %', render: (c) => <span className="numbar"><Bar pct={c.profile.null_pct} tone={c.profile.null_pct >= 50 ? 'warn' : 'accent'} width={90} />{fmt.pct(c.profile.null_pct)}</span>, value: (c) => c.profile.null_pct },
     { key: 'dist', label: 'Distinct %', render: (c) => <span className="numbar"><Bar pct={c.profile.distinct_pct} tone="good" width={90} />{fmt.pct(c.profile.distinct_pct)}</span>, value: (c) => c.profile.distinct_pct },
     { key: 'dc', label: 'Distinct', render: (c) => fmt.n(c.profile.distinct_count), value: (c) => c.profile.distinct_count, align: 'right' },
@@ -322,7 +335,7 @@ function ProfilePanel({ t, onOpenColumn, onReload }) {
       <div className="muted small pad-x">
         {live ? `Computed live in ${live.elapsed_ms} ms (not saved)` : `Profiled ${tp.profiled_at?.slice(0, 16)}${tp.sampled_rows ? ` on a ${fmt.n(tp.sampled_rows)}-row sample` : ''}`} · click a column for full detail
       </div>
-      <DataGrid columns={gridCols} rows={withP} rowKey={(c) => c.column} onRowClick={(c) => onOpenColumn(c.column)} />
+      <DataGrid columns={gridCols} rows={withP} rowKey={(c) => c.column} onRowClick={(c) => onOpenColumn(c.column)} id="profile" filterable="Filter columns…" />
     </>
   )
 }
@@ -349,7 +362,7 @@ function RelPanel({ t, allTables, onOpenTable }) {
   const rows = t.relationships.map((r) => ({ ...r, dir: r.from_table === t.table && r.from_schema === t.schema ? 'out' : 'in' }))
   return (
     <>
-      <DataGrid rows={rows} empty="No relationships discovered for this table (run bearings relate)" columns={[
+      <DataGrid rows={rows} id="tableRels" empty="No relationships discovered for this table (run bearings relate)" columns={[
         { key: 'dir', label: '', render: (r) => r.dir === 'out' ? '→' : '←', width: 30 },
         { key: 'from', label: 'From (FK)', render: (r) => <span className="mono">{r.from_table}.{r.from_column}</span>, value: (r) => r.from_table + r.from_column },
         { key: 'to', label: 'To (key)', render: (r) => (

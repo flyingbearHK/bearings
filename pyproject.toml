@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bearings"
-version = "0.2.0"
-description = "Get your bearings in unfamiliar source data: a local data-modelling workbench (DuckDB + web UI) for searching, profiling, sampling and relating CSV/Parquet exports."
+version = "0.3.0"
+description = "Get your bearings in unfamiliar source data: a local data-modelling workbench (DuckDB + web UI) for searching, profiling, sampling and relating CSV, Parquet, JSON and Excel exports or Databricks schemas."
 readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "Flyingbear", email = "flyingbearhk@users.noreply.github.com" }]
 requires-python = ">=3.10"
-keywords = ["data-modelling", "data-profiling", "duckdb", "data-catalog", "databricks", "cdm", "fastapi"]
+keywords = ["data-modelling", "data-profiling", "duckdb", "data-catalog", "databricks", "excel", "cdm", "fastapi"]
 classifiers = [
   "License :: OSI Approved :: MIT License",
   "Programming Language :: Python :: 3",
@@ -53,8 +53,8 @@ dev = [
 bearings = "bearings.cli:app"
 dm = "bearings.cli:app"   # short alias
 
-[tool.setuptools]
-packages = ["bearings"]
+[tool.setuptools.packages.find]
+include = ["bearings*"]   # bearings, bearings.loaders, bearings.remote, bearings.remote.connectors
 
 [tool.setuptools.package-data]
 bearings = ["static/**/*"]

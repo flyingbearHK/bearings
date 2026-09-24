@@ -1,17 +1,22 @@
-"""Named Databricks connection profiles (~/.bearings/connections.toml) and client factories.
+"""Named connection profiles (~/.bearings/connections.toml) – one table per profile, no secrets.
 
-A profile holds no secrets: sign-in is browser OAuth through Entra ID (`auth_type="external-browser"`),
-and the Databricks SDK caches/refreshes the token in its own cache (~/.databricks/). A profile can
-instead point at an existing Databricks CLI profile in ~/.databrickscfg (`profile = "..."`).
+    [dev]
+    type = "databricks"          # which connector (bearings.remote.connectors); default databricks
+    host = "https://adb-….azuredatabricks.net"
+    warehouse_id = "…"
+
+The settings a profile holds depend on its connector (`Connector.fields`). Sign-in is done by the
+connector (for Databricks: browser OAuth through Entra ID, token cached by the Databricks SDK).
 """
 from __future__ import annotations
 
 import os
 import re
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import RemoteError, require_extra
+from . import RemoteError
+from . import connectors
 
 try:  # Python 3.11+
     import tomllib
@@ -31,23 +36,36 @@ def config_path() -> Path:
 
 @dataclass
 class Connection:
+    """A profile: a name, a connector type and that connector's settings (`conn.host`, `conn.get("host")`)."""
     name: str
-    host: str = ""
-    warehouse_id: str = ""
-    profile: str = ""                       # optional ~/.databrickscfg profile to reuse instead of host/auth_type
-    auth_type: str = "external-browser"     # browser sign-in (Entra ID); anything the SDK accepts works
-    extra: dict = field(default_factory=dict)
+    type: str = connectors.DEFAULT_TYPE
+    settings: dict = field(default_factory=dict)
+
+    def _field(self, key: str):
+        try:
+            cls = connectors.connector_class(self.type)
+        except RemoteError:
+            return None
+        return next((f for f in cls.fields if f.key == key), None)
+
+    def get(self, key: str, default=""):
+        v = self.settings.get(key)
+        if v not in (None, ""):
+            return v
+        f = self._field(key)
+        return f.default if f and f.default else default
+
+    def __getattr__(self, key: str):
+        # connector settings read like attributes (conn.host, conn.warehouse_id); unknown names still fail
+        if key.startswith("_") or key in ("name", "type", "settings"):
+            raise AttributeError(key)
+        if key in self.settings or self._field(key) is not None:
+            return self.get(key)
+        raise AttributeError(f"'{self.type}' connection has no setting '{key}'")
 
     @property
-    def hostname(self) -> str:
-        return re.sub(r"^https?://", "", self.host).rstrip("/")
-
-    @property
-    def http_path(self) -> str:
-        if not self.warehouse_id:
-            raise RemoteError(f"Connection '{self.name}' has no SQL warehouse. List them with `bearings remote warehouses {self.name}`, "
-                              f"then: bearings remote add {self.name} --warehouse <id>")
-        return f"/sql/1.0/warehouses/{self.warehouse_id}"
+    def connector(self) -> "connectors.Connector":
+        return connectors.for_connection(self)
 
 
 def _toml_value(v) -> str:
@@ -58,39 +76,54 @@ def _toml_value(v) -> str:
     return '"' + str(v).replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def load_all() -> dict[str, Connection]:
+_parsed: dict = {"key": None, "data": {}}
+
+
+def _read() -> dict:
     p = config_path()
-    if not p.exists():
+    try:
+        st = p.stat()
+    except FileNotFoundError:
         return {}
-    data = tomllib.loads(p.read_text(encoding="utf-8"))
+    key = (str(p), st.st_mtime_ns, st.st_size)
+    if _parsed["key"] != key:  # re-parse only when the file changed (it is read on every remote query)
+        _parsed["data"] = tomllib.loads(p.read_text(encoding="utf-8"))
+        _parsed["key"] = key
+    return _parsed["data"]
+
+
+def load_all() -> dict[str, Connection]:
     out = {}
-    for name, d in data.items():
+    for name, d in _read().items():
         if not isinstance(d, dict):
             continue
-        known = {k: d[k] for k in ("host", "warehouse_id", "profile", "auth_type") if k in d}
-        extra = {k: v for k, v in d.items() if k not in known}
-        out[name] = Connection(name=name, extra=extra, **known)
+        settings = {k: v for k, v in d.items() if k != "type"}
+        out[name] = Connection(name=name, type=str(d.get("type") or connectors.DEFAULT_TYPE).lower(), settings=settings)
     return out
 
 
 def save_all(conns: dict[str, Connection]) -> Path:
     p = config_path()
     p.parent.mkdir(parents=True, exist_ok=True)
-    lines = ["# Bearings – Databricks connection profiles. No secrets here: sign-in is browser OAuth.", ""]
+    lines = ["# Bearings – remote connection profiles. No secrets here: sign-in is done by each platform's own login.", ""]
     for c in sorted(conns.values(), key=lambda c: c.name):
         lines.append(f"[{c.name}]")
-        d = asdict(c)
-        for k in ("host", "warehouse_id", "profile", "auth_type"):
-            if d[k]:
-                lines.append(f"{k} = {_toml_value(d[k])}")
-        for k, v in (c.extra or {}).items():
-            lines.append(f"{k} = {_toml_value(v)}")
+        lines.append(f"type = {_toml_value(c.type)}")
+        try:
+            order = [f.key for f in connectors.connector_class(c.type).fields]
+        except RemoteError:
+            order = []
+        for k in order + sorted(k for k in c.settings if k not in order):
+            v = c.settings.get(k)
+            if v not in (None, ""):
+                lines.append(f"{k} = {_toml_value(v)}")
         lines.append("")
     p.write_text("\n".join(lines), encoding="utf-8")
     try:
         p.chmod(0o600)
     except OSError:  # pragma: no cover
         pass
+    _parsed["key"] = None
     return p
 
 
@@ -102,16 +135,19 @@ def get(name: str) -> Connection:
     return conns[name]
 
 
-def upsert(name: str, **fields) -> Connection:
+def upsert(name: str, type: str | None = None, **fields) -> Connection:
+    """Create or update a profile. `fields` are connector settings; None leaves a setting unchanged."""
     if not NAME_RE.match(name):
         raise RemoteError("Connection names may only use letters, digits, '-' and '_'")
     conns = load_all()
-    c = conns.get(name) or Connection(name=name)
+    c = conns.get(name) or Connection(name=name, type=(type or connectors.DEFAULT_TYPE).lower())
+    if type and type.lower() != c.type:
+        c = Connection(name=name, type=type.lower())   # switching platform: old settings don't apply
+    connectors.connector_class(c.type)                 # unknown type → clear error
     for k, v in fields.items():
         if v is not None:
-            setattr(c, k, v)
-    if not c.host and not c.profile:
-        raise RemoteError("Give the workspace URL (--host https://adb-….azuredatabricks.net) or a Databricks CLI --profile")
+            c.settings[k] = v
+    connectors.connector_class(c.type)(c).validate()
     conns[name] = c
     save_all(conns)
     return c
@@ -126,44 +162,15 @@ def remove(name: str) -> bool:
     return True
 
 
-# ------------------------------------------------------------------ clients (tests replace these factories)
-_clients: dict = {}
-
-
-def _default_workspace_client(conn: Connection):
-    require_extra()
-    from databricks.sdk import WorkspaceClient
-    if conn.profile:
-        return WorkspaceClient(profile=conn.profile, product="bearings")
-    return WorkspaceClient(host=conn.host, auth_type=conn.auth_type or None, product="bearings")
-
-
-def _default_sql_connect(conn: Connection, client, session_configuration: dict | None = None):
-    require_extra()
-    from databricks import sql
-    # reuse the SDK's (cached, refreshed) credentials, so there is only one browser sign-in
-    return sql.connect(server_hostname=client.config.host.replace("https://", "").rstrip("/") if client.config.host else conn.hostname,
-                       http_path=conn.http_path, credentials_provider=lambda: client.config.authenticate,
-                       user_agent_entry="bearings", session_configuration=session_configuration or None)
-
-
-workspace_client_factory = _default_workspace_client
-sql_connect_factory = _default_sql_connect
-
-
+# ------------------------------------------------------------------ compatibility helpers
 def workspace_client(conn: Connection):
-    """One cached SDK client per connection (keeps the OAuth token in memory for the server's lifetime)."""
-    key = (conn.name, conn.host, conn.profile, conn.auth_type)
-    if key not in _clients:
-        _clients[key] = workspace_client_factory(conn)
-    return _clients[key]
+    """The platform's metadata client (Databricks: the SDK WorkspaceClient), cached per profile."""
+    return getattr(conn.connector, "client", None)
 
 
 def sql_connect(conn: Connection, session_configuration: dict | None = None):
-    if session_configuration:
-        return sql_connect_factory(conn, workspace_client(conn), session_configuration)
-    return sql_connect_factory(conn, workspace_client(conn))
+    return conn.connector.sql_connect(session_configuration)
 
 
 def reset_clients():
-    _clients.clear()
+    connectors.reset()

@@ -282,3 +282,67 @@ button:disabled { opacity: .5; cursor: default; }
 .remote-toggle.on { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); }
 .cache-facts { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 4px; }
 .warn-text { color: var(--warn); font-weight: 500; }
+
+/* grid toolbar: quick filter, hide empty columns, in-cell highlights */
+.grid-bar { display: flex; align-items: center; gap: 10px; padding: 6px 12px; flex-wrap: wrap; }
+.grid-filter { width: 260px; max-width: 100%; font-size: .92em; }
+mark { background: var(--hl-strong); color: inherit; border-radius: 2px; padding: 0 1px; }
+.grid td mark { background: var(--hl-strong); }
+.pane-head .pane-sort { text-transform: none; letter-spacing: 0; font-weight: 400; font-size: .92em; padding: 0 4px; height: 20px; border-color: var(--border); background: transparent; color: var(--muted); }
+.pane-head { align-items: center; }
+.btn.small { padding: 2px 8px; font-size: .9em; }
+.btn.jump { color: var(--muted); }
+.btn.jump kbd { font-size: .85em; }
+.recent { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 18px; }
+
+/* modal dialogs */
+.modal-back { position: fixed; inset: 0; background: rgba(15, 20, 28, .38); z-index: 50; display: flex; align-items: flex-start; justify-content: center; padding: 8vh 16px 16px; animation: fade .12s ease-out; }
+@keyframes fade { from { opacity: 0 } to { opacity: 1 } }
+.modal { background: var(--panel); border: 1px solid var(--border-strong); border-radius: 12px; box-shadow: 0 24px 60px rgba(0,0,0,.25); width: min(760px, 100%); max-height: 84vh; display: flex; flex-direction: column; overflow: hidden; }
+.modal-head { display: flex; align-items: baseline; gap: 12px; padding: 14px 18px 10px; border-bottom: 1px solid var(--border); }
+.modal-head h3 { margin: 0; font-size: 1.15em; }
+.modal-body { padding: 14px 18px 16px; overflow: auto; display: flex; flex-direction: column; gap: 12px; }
+.modal .error { margin: 10px 18px 0; }
+
+/* add data */
+.dropzone, .welcome-drop { border: 2px dashed var(--border-strong); border-radius: 12px; padding: 26px 16px; text-align: center; display: flex; flex-direction: column; gap: 6px; align-items: center; background: var(--panel-2); transition: border-color .12s, background .12s; }
+.dropzone.over, .welcome-drop:hover { border-color: var(--accent); background: var(--accent-soft); }
+.welcome-drop { cursor: pointer; margin: 14px 0 22px; max-width: 640px; }
+.dz-icon { font-size: 28px; color: var(--accent); line-height: 1; }
+.dz-actions { display: flex; gap: 8px; margin-top: 8px; }
+.or { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: .9em; }
+.or::before, .or::after { content: ""; flex: 1; border-top: 1px solid var(--border); }
+.path-row { display: flex; gap: 8px; }
+.path-row .grow { flex: 1; min-width: 0; }
+.browser { border: 1px solid var(--border); border-radius: var(--radius); max-height: 260px; display: flex; flex-direction: column; overflow: hidden; }
+.browser-head { display: flex; align-items: center; gap: 10px; padding: 6px 10px; background: var(--panel-2); border-bottom: 1px solid var(--border); }
+.browser .list { overflow: auto; }
+.progress { height: 8px; background: var(--panel-2); border-radius: 4px; overflow: hidden; }
+.progress > div { height: 100%; background: var(--accent); transition: width .3s; }
+.form-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.form-row label:not(.check) { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); }
+.form-row input.num { width: 60px; }
+.pv-table { border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; display: flex; flex-direction: column; max-height: 42vh; }
+.pv-head { display: flex; align-items: center; gap: 8px; padding: 6px 12px; background: var(--panel-2); border-bottom: 1px solid var(--border); }
+.pv-table .list { overflow: auto; }
+.pv-table li.off { opacity: .5; }
+.pv-comments { padding: 8px 12px; border-top: 1px solid var(--border); display: flex; flex-direction: column; gap: 4px; }
+.done-list { max-height: 40vh; overflow: auto; border: 1px solid var(--border); border-radius: var(--radius); }
+.drop-overlay { position: fixed; inset: 10px; z-index: 60; border: 3px dashed var(--accent); border-radius: 16px; background: color-mix(in srgb, var(--accent-soft) 88%, transparent); display: flex; align-items: center; justify-content: center; font-size: 1.5em; font-weight: 600; color: var(--accent); pointer-events: none; text-align: center; }
+.toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); background: var(--text); color: var(--panel); padding: 7px 14px; border-radius: 8px; z-index: 70; font-size: .92em; box-shadow: 0 8px 24px rgba(0,0,0,.2); max-width: 80vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* quick open (⌘/Ctrl+K) */
+.quick-open { width: min(680px, 100%); }
+.qo-input { border: 0 !important; outline: none !important; border-bottom: 1px solid var(--border) !important; border-radius: 0; padding: 14px 18px; font-size: 1.15em; background: transparent; }
+.qo-list { list-style: none; margin: 0; padding: 6px 0; overflow: auto; max-height: 56vh; }
+.qo-list li { display: flex; align-items: center; gap: 10px; padding: 6px 18px; cursor: pointer; min-width: 0; }
+.qo-list li.active { background: var(--accent-soft); }
+.qo-list li.qo-group { cursor: default; font-size: .8em; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); padding: 8px 18px 2px; background: none; }
+.qo-icon { color: var(--muted); width: 14px; text-align: center; }
+.qo-comment { max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.qo-foot { padding: 8px 18px; border-top: 1px solid var(--border); display: flex; gap: 6px; align-items: center; }
+.shortcuts { width: min(560px, 100%); }
+.shortcuts .grid td { white-space: normal; }
+.brand-by { white-space: nowrap; }
+@media (max-width: 1400px) { .top .stats-line { display: none; } }
+@media (max-width: 1180px) { .btn.jump .jump-label, .top .add-label { display: none; } .top { gap: 8px; } }

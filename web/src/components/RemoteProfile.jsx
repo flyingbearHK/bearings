@@ -17,14 +17,14 @@ export function useRemoteJob(onDone) {
   return { job, err, start, running: job?.status === 'running', clear: () => setJob(null) }
 }
 
-/** "⚡ Profile on Databricks" for one remote table (runs on the SQL warehouse). */
-export default function RemoteProfileButton({ schema, table, profiled, stale, onDone }) {
+/** "⚡ Profile on <platform>" for one remote table (runs on its SQL engine, e.g. the Databricks SQL warehouse). */
+export default function RemoteProfileButton({ schema, table, profiled, stale, onDone, platform = 'Databricks', compute = 'SQL warehouse' }) {
   const { job, err, start, running } = useRemoteJob(onDone)
-  const label = running ? 'Profiling on Databricks…' : profiled ? (stale ? '⚡ Re-profile (source changed)' : '⚡ Re-profile') : '⚡ Profile on Databricks'
+  const label = running ? `Profiling on ${platform}…` : profiled ? (stale ? '⚡ Re-profile (source changed)' : '⚡ Re-profile') : `⚡ Profile on ${platform}`
   return (
     <span className="remote-profile">
       <button className={`btn ${!profiled || stale ? 'primary' : ''}`} disabled={running}
-        title="Runs on the SQL warehouse: exact counts over the whole table, a sample for top values and patterns, and key values for relationship discovery"
+        title={`Runs on the ${compute}: exact counts over the whole table, a sample for top values and patterns, and key values for relationship discovery`}
         onClick={() => start({ tables: [`${schema}.${table}`] })}>{label}</button>
       {job?.status === 'failed' && <span className="error small">{job.errors[0]?.error}</span>}
       {err && <span className="error small">{err}</span>}
@@ -34,7 +34,7 @@ export default function RemoteProfileButton({ schema, table, profiled, stale, on
 
 /** Wakes the SQL warehouse when a remote table is opened and shows its state (a serverless warehouse
  *  that has been idle takes ~15-20 s to start; after that live queries are quick). */
-export function WarehouseState({ connection }) {
+export function WarehouseState({ connection, compute = 'warehouse' }) {
   const [st, setSt] = useState(null)
   useEffect(() => {
     let off = false
@@ -49,9 +49,9 @@ export function WarehouseState({ connection }) {
     return () => { off = true; clearTimeout(timer) }
   }, [connection])
   if (!st) return null
-  if (st.state === 'warming') return <span className="wh warming" title="The first query after the warehouse has been idle waits for it to start">⏳ waking up the SQL warehouse…</span>
-  if (st.state === 'ready') return <span className="wh ready" title="Live queries run on the SQL warehouse">● warehouse ready</span>
-  if (st.state === 'error') return <span className="wh error" title={st.error}>● warehouse unavailable</span>
+  if (st.state === 'warming') return <span className="wh warming" title={`The first query after the ${compute} has been idle waits for it to start`}>⏳ waking up the {compute}…</span>
+  if (st.state === 'ready') return <span className="wh ready" title={`Live queries run on the ${compute}`}>● {compute} ready</span>
+  if (st.state === 'error') return <span className="wh error" title={st.error}>● {compute} unavailable</span>
   return null
 }
 

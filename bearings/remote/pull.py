@@ -1,6 +1,6 @@
 """`bearings pull`: copy (a sample of) a remote table into DuckDB so every local feature works on it.
 
-Rows stream from the SQL warehouse as Arrow batches into a temporary Parquet file; the DuckDB write
+Rows stream from the remote SQL engine (Databricks: the SQL warehouse) as Arrow batches into a temporary Parquet file; the DuckDB write
 lock is only taken for the final, fast `CREATE TABLE … AS SELECT * FROM read_parquet(…)`.
 By default the copy lands under the remote alias (`opera_dbx.reservation`), where it replaces the
 metadata-only entry in the app; `--as <schema>` puts it somewhere else.
@@ -17,6 +17,7 @@ from pathlib import Path
 from ..db import META, connect, fq, qi, remote_aliases, ro, safe_name
 from . import RemoteError
 from . import connections as cx
+from .connectors import dialect_for
 from .sync import remote_fq
 
 FORBIDDEN = re.compile(r";|--|/\*|\b(insert|update|delete|merge|drop|create|alter|grant|revoke|truncate|copy|optimize|vacuum|call)\b", re.I)
@@ -28,28 +29,36 @@ _write_lock = __import__("threading").Lock()
 KEY_BUCKETS = 1_000_000
 
 
-def key_filter(col: str, ppm: int) -> str:
+def key_filter(col: str, ppm: int, d=None) -> str:
     """Rows whose key hashes into the first `ppm` of a million buckets. The same expression on parent and child
-    keeps the same key values on both sides, so the samples join (xxhash64 is deterministic on Databricks)."""
-    q = "`" + col.replace("`", "``") + "`"
-    return f"pmod(xxhash64(CAST({q} AS STRING)), {KEY_BUCKETS}) < {int(ppm)}"
+    keeps the same key values on both sides, so the samples join (the dialect's hash must be deterministic)."""
+    d = d or dialect_for(None)
+    return f"{d.hash_bucket(d.quote(col), KEY_BUCKETS)} < {int(ppm)}"
 
 
 def build_sql(src: dict, table: str, rows: int | None, where: str | None, first: bool = False, total: int | None = None,
               key_sample: dict | None = None) -> str:
-    """SELECT for a pull. A random sample uses TABLESAMPLE (p PERCENT) – Spark's `(n ROWS)` form just takes the
-    first n rows – with p sized from the table's row count (a cheap metadata count on Delta) plus 10% headroom.
-    A key sample keeps the rows whose key falls in a hash range shared with related tables (see key_filter)."""
+    """SELECT for a pull. A random sample uses the dialect's TABLESAMPLE (Databricks: `p PERCENT` – Spark's
+    `(n ROWS)` form just takes the first n rows) with p sized from the table's row count (a cheap metadata count
+    on Delta) plus 10% headroom; without TABLESAMPLE it orders randomly. A key sample keeps the rows whose key
+    falls in a hash range shared with related tables (see key_filter)."""
     if where and FORBIDDEN.search(where):
         raise RemoteError("--where must be a simple filter expression")
+    d = dialect_for(src.get("connection"))
     if key_sample:
-        return f"SELECT * FROM {remote_fq(src, table)} WHERE {key_filter(key_sample['column'], key_sample['ppm'])}"
+        return f"SELECT * FROM {remote_fq(src, table)} WHERE {key_filter(key_sample['column'], key_sample['ppm'], d)}"
     sql = f"SELECT * FROM {remote_fq(src, table)}"
+    order = ""
     if rows and not where and not first and total and total > rows:
         pct = min(100.0, round(100.0 * rows / total * 1.1, 6))
-        sql += f" TABLESAMPLE ({pct} PERCENT)"
+        ts = d.tablesample(pct)
+        if ts:
+            sql += ts
+        else:
+            order = f" ORDER BY {d.random_order()}"
     if where:
         sql += f" WHERE {where}"
+    sql += order
     if rows:
         sql += f" LIMIT {int(rows)}"
     return sql
@@ -82,7 +91,7 @@ def pull(db_path: Path, ref: str, rows: int | None = None, where: str | None = N
     try:
         import pyarrow.parquet as pq
     except ImportError as e:  # pragma: no cover
-        raise RemoteError("`bearings pull` needs the Databricks extra: uv sync --extra databricks") from e
+        raise RemoteError(f"`bearings pull` needs pyarrow – install the connector's extra: uv sync --extra {conn.connector.extra or 'databricks'}") from e
 
     t0 = time.time()
     n = 0
@@ -97,7 +106,7 @@ def pull(db_path: Path, ref: str, rows: int | None = None, where: str | None = N
                     cur.execute(f"SELECT count(*) FROM {remote_fq(src, table)}")
                     total = int(list(cur.fetchone())[0])
                     echo(f"  {total:,} rows in {src['catalog']}.{src['schema']}.{table}")
-                version = delta_version(cur, src, table)
+                version = conn.connector.table_version(cur, remote_fq(src, table))
                 sql = build_sql(src, table, rows, where, first, total, key_sample=key_sample)
                 echo(f"  {sql}")
                 cur.execute(sql)
@@ -128,9 +137,9 @@ def pull(db_path: Path, ref: str, rows: int | None = None, where: str | None = N
             con.execute(f"CREATE OR REPLACE TABLE {fq(ts, tt)} AS SELECT * FROM read_parquet(?)", [str(part)])
             ncols = len(con.execute(f"DESCRIBE {fq(ts, tt)}").fetchall())
             con.execute(f"INSERT INTO {META}.load_log VALUES (?,?,?,?,?,?,?)",
-                        [ts, tt, f"databricks://{conn.name}/{src['catalog']}.{src['schema']}.{table}", "databricks", n, ncols,
+                        [ts, tt, f"{conn.type}://{conn.name}/{src['catalog']}.{src['schema']}.{table}", conn.type, n, ncols,
                          dt.datetime.now()])
-            # carry the Unity Catalog descriptions over, so the copy stays searchable by comment
+            # carry the remote catalog's descriptions over, so the copy stays searchable by comment
             con.execute(f"DELETE FROM {META}.comments WHERE schema_name=? AND table_name=?", [ts, tt])
             rowsc = [[ts, tt, c, cm] for c, cm in comments]
             if tcomment and tcomment[0]:
@@ -168,21 +177,9 @@ def pull(db_path: Path, ref: str, rows: int | None = None, where: str | None = N
             "masked": masked, "version": version, "seconds": round(time.time() - t0, 1)}
 
 
-def delta_version(cur, src: dict, table: str) -> int | None:
-    """Current Delta version of a table (None for views / non-Delta tables or when history isn't readable)."""
-    try:
-        cur.execute(f"DESCRIBE HISTORY {remote_fq(src, table)} LIMIT 1")
-        tbl = cur.fetchall_arrow()
-        if tbl.num_rows and "version" in tbl.column_names:
-            return int(tbl.column("version")[0].as_py())
-    except Exception:
-        pass
-    return None
-
-
 def check_freshness(db_path: Path, aliases: list[str] | None = None, echo=lambda *_: None) -> list[dict]:
-    """Compare each cached table's Delta version with the current one on Databricks (one small query per
-    table, 3 at a time). Tables whose data moved get their profile marked stale – `refresh` / `cache --changed`
+    """Compare each cached table's data version (Delta) with the current one on the remote (one small query
+    per table, 3 at a time). Tables whose data moved get their profile marked stale – `refresh` / `cache --changed`
     then re-profile and re-cache them. Returns the changed tables."""
     from concurrent.futures import ThreadPoolExecutor
 
@@ -194,7 +191,10 @@ def check_freshness(db_path: Path, aliases: list[str] | None = None, echo=lambda
 
     def one(r):
         a, t, v = r
-        res = rq.run(srcs[a]["connection"], f"DESCRIBE HISTORY {remote_fq(srcs[a], t)} LIMIT 1", limit=1)
+        vsql = cx.get(srcs[a]["connection"]).connector.version_sql(remote_fq(srcs[a], t))
+        if not vsql:
+            return a, t, v, None
+        res = rq.run(srcs[a]["connection"], vsql, limit=1)
         cols = res["columns"]
         return a, t, v, int(res["rows"][0][cols.index("version")]) if res["rows"] and "version" in cols else None
 
@@ -334,6 +334,8 @@ def pull_many(db_path: Path, aliases: list[str] | None = None, tables: list[str]
             big = {(a, t): sizes[(a, t)] for a, t, r in plan if r and (a, t) in sizes}
             # tables already cached as a (keyed) sample count as big too, so a re-cache keeps groups consistent
             big.update({k: v for k, v in sizes.items() if max_rows and v > max_rows})
+            # join-consistent samples need a deterministic hash in the remote dialect
+            big = {k: v for k, v in big.items() if k[0] in srcs and dialect_for(srcs[k[0]]["connection"]).supports_key_sampling}
             keyed = plan_key_samples(con, big, {a: sample_rows for a, _, _ in plan})
     from concurrent.futures import ThreadPoolExecutor
 

@@ -64,7 +64,7 @@ export default function LookupResults({ data, loading, error, filter, onClose, o
               <span className={`chip ${r.count ? 'accent' : ''}`}>{fmt.n(r.count)} row{r.count === 1 ? '' : 's'}</span>
               {r.count > r.rows.length && <span className="muted small">showing {fmt.n(r.rows.length)}</span>}
               <span className="muted small">on {r.match_columns.join(', ') || '—'}</span>
-              {r.source === 'remote' && <span className="chip cloud" title="Ran on the Databricks SQL warehouse">⚡ Databricks</span>}
+              {r.source === 'remote' && <span className="chip cloud" title={`Ran live on ${r.platform || 'the remote source'}`}>⚡ {r.platform || 'Remote'}</span>}
               {r.source === 'sample' && <span className="chip warn" title={`Searched the cached sample (${fmt.n(r.cached_rows)} of ${fmt.n(r.total_rows)} rows); tick ⚡ Remote for the whole table`}>{STORAGE.sample.label}</span>}
               {r.source === 'cached' && <span className="chip good" title={STORAGE.cached.title}>{STORAGE.cached.label}</span>}
               {r.error && <span className="chip bad" title={r.error}>{r.error.slice(0, 60)}</span>}
@@ -78,7 +78,8 @@ export default function LookupResults({ data, loading, error, filter, onClose, o
                 }}>CSV</button>}
               </span>
             </div>
-            {!isCollapsed && r.rows.length > 0 && <DataGrid columns={cols} rows={r.rows} dense maxHeight={420} />}
+            {!isCollapsed && r.rows.length > 0 && <DataGrid columns={cols} rows={r.rows} dense maxHeight={420} id="lookup"
+              filterable={r.rows.length > 5 ? 'Filter rows…' : undefined} hideEmptyToggle highlight={filter.op === '~' || filter.op === '=' ? filter.value.split(',')[0].trim() : undefined} />}
           </section>
         )
       })}

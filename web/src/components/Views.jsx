@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react'
 import { api, exportUrl, fmt, store } from '../api.js'
 import { Bar, Tags } from './Charts.jsx'
-import DataGrid, { Cell } from './DataGrid.jsx'
+import DataGrid, { Cell, Hl } from './DataGrid.jsx'
 
 export function RelationshipsView({ onOpenTable, scope }) {
   const [rows, setRows] = useState(null)
@@ -19,10 +19,10 @@ export function RelationshipsView({ onOpenTable, scope }) {
           <select value={min} onChange={(e) => setMin(Number(e.target.value))}>{[0, 0.6, 0.8, 0.9].map((x) => <option key={x} value={x}>{x}</option>)}</select></label>
         <span className="muted small">{shown.length} of {rows.length} · discovered by <code>bearings relate</code> (name similarity + value overlap)</span>
       </div>
-      <DataGrid rows={shown} empty="No relationships. Run: bearings profile && bearings relate" columns={[
-        { key: 'from', label: 'From (FK)', render: (r) => <button className="link mono" onClick={() => onOpenTable(r.from_schema, r.from_table, r.from_column)}>{r.from_table}.{r.from_column}</button>, value: (r) => r.from_table + '.' + r.from_column },
+      <DataGrid rows={shown} id="rels" highlight={f} empty="No relationships. Run: bearings profile && bearings relate" columns={[
+        { key: 'from', label: 'From (FK)', render: (r) => <button className="link mono" onClick={() => onOpenTable(r.from_schema, r.from_table, r.from_column)}><Hl text={`${r.from_table}.${r.from_column}`} /></button>, value: (r) => r.from_table + '.' + r.from_column },
         { key: 'arrow', label: '', render: () => '→', width: 24 },
-        { key: 'to', label: 'To (key)', render: (r) => <button className="link mono" onClick={() => onOpenTable(r.to_schema, r.to_table, r.to_column)}>{r.to_table}.{r.to_column}</button>, value: (r) => r.to_table + '.' + r.to_column },
+        { key: 'to', label: 'To (key)', render: (r) => <button className="link mono" onClick={() => onOpenTable(r.to_schema, r.to_table, r.to_column)}><Hl text={`${r.to_table}.${r.to_column}`} /></button>, value: (r) => r.to_table + '.' + r.to_column },
         { key: 'overlap_pct', label: 'Overlap', render: (r) => <span className="numbar"><Bar pct={r.overlap_pct} tone="good" width={70} />{fmt.pct(r.overlap_pct)}</span>, align: 'right' },
         { key: 'from_distinct', label: 'FK distinct', render: (r) => fmt.n(r.from_distinct), align: 'right' },
         { key: 'name_score', label: 'Name sim.', render: (r) => r.name_score.toFixed(2), align: 'right' },
@@ -46,7 +46,7 @@ export function AnnotationsView({ onOpenTable, refreshKey, scope }) {
         <a className="btn" href={exportUrl('xlsx', scope)}>Export mapping workbook (.xlsx)</a>
         <a className="btn" href={exportUrl('json', scope)}>Export JSON</a>
       </div>
-      <DataGrid rows={shown} empty="No annotations yet — open a column's profile (▤) to tag it or map it to a CDM entity" columns={[
+      <DataGrid rows={shown} id="ann" highlight={f} empty="No annotations yet — open a column's profile (▤) to tag it or map it to a CDM entity" columns={[
         { key: 'table_name', label: 'Table', render: (r) => <button className="link mono" onClick={() => onOpenTable(r.schema_name, r.table_name, r.column_name || null)}>{r.schema_name}.{r.table_name}</button>, value: (r) => r.table_name },
         { key: 'column_name', label: 'Column', render: (r) => <span className="mono">{r.column_name || <span className="muted">(table)</span>}</span> },
         { key: 'tags', label: 'Tags', render: (r) => <Tags tags={r.tags} /> },
@@ -67,7 +67,8 @@ export function SqlView({ sql, setSql, tables }) {
   const [engine, setEngine] = useState(() => store.get('sqlEngine', 'duckdb'))
   useEffect(() => { api.remote().then((r) => setConns(r.connections || [])).catch(() => {}) }, [])
   useEffect(() => store.set('sqlEngine', engine), [engine])
-  const remoteEngine = engine.startsWith('databricks:')
+  const remoteEngine = engine !== 'duckdb'
+  const engineConn = conns.find((c) => `${c.type || 'databricks'}:${c.name}` === engine)
   const shown = tables.filter((t) => (remoteEngine ? t.kind === 'remote' || t.remote : t.kind !== 'remote'))
   const run = async () => {
     setBusy(true); setErr(null)
@@ -94,17 +95,17 @@ export function SqlView({ sql, setSql, tables }) {
         <div className="subbar">
           {conns.length > 0 && (
             <select className="engine" value={engine} onChange={(e) => setEngine(e.target.value)}
-              title="Where the query runs. On Databricks, attached aliases (e.g. dev_raw_pms.reservation) are expanded to catalog.schema.table">
+              title="Where the query runs. On a remote connection, attached aliases (e.g. dev_raw_pms.reservation) are expanded to catalog.schema.table">
               <option value="duckdb">Local (DuckDB)</option>
-              {conns.map((c) => <option key={c.name} value={`databricks:${c.name}`}>⚡ Databricks · {c.name}</option>)}
+              {conns.map((c) => <option key={c.name} value={`${c.type || 'databricks'}:${c.name}`}>⚡ {c.label || 'Databricks'} · {c.name}</option>)}
             </select>
           )}
           <button className="btn primary" onClick={run} disabled={busy || !sql.trim()}>{busy ? 'Running…' : 'Run ⌘↵'}</button>
-          {remoteEngine && <span className="muted small">Databricks SQL, read-only, runs on the SQL warehouse</span>}
+          {remoteEngine && <span className="muted small">{engineConn?.label || 'Remote'} SQL, read-only, runs on the {engineConn?.compute_label || 'remote engine'}</span>}
           {res && <span className="muted small">{fmt.n(res.rows.length)} rows{res.truncated ? ' (first 1,000)' : ''} · {res.elapsed_ms} ms</span>}
         </div>
         {err && <pre className="error">{err}</pre>}
-        {res && <DataGrid columns={cols} rows={res.rows} dense />}
+        {res && <DataGrid columns={cols} rows={res.rows} dense filterable="Filter result rows…" hideEmptyToggle id="sql" />}
       </div>
     </div>
   )

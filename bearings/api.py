@@ -23,11 +23,13 @@ STATIC = Path(__file__).parent / "static"
 
 @asynccontextmanager
 async def _lifespan(_app):
-    _warm_on_start()  # wake the Databricks warehouse(s) in the background, if remote schemas are attached
+    _warm_on_start()  # wake the remote SQL engine(s) (Databricks warehouses) in the background, if remote schemas are attached
     yield
 
 
-app = FastAPI(title="Bearings", version="0.1.0", lifespan=_lifespan)
+from . import __version__  # noqa: E402
+
+app = FastAPI(title="Bearings", version=__version__, lifespan=_lifespan)
 
 
 @app.exception_handler(DatabaseBusy)
@@ -43,7 +45,7 @@ def _remote_error_handler():
 
     @app.exception_handler(RemoteError)
     async def remote_error(_: Request, e):  # noqa: ANN001
-        return JSONResponse({"detail": f"Databricks: {e}"}, status_code=400)
+        return JSONResponse({"detail": f"{getattr(e, 'platform', None) or 'Remote'}: {e}"}, status_code=400)
 
 
 _remote_error_handler()
@@ -79,20 +81,20 @@ def _table_or_404(cat, schema, table):
     return tb
 
 
-def remote_hint(schema: str, table: str) -> str:
-    return (f"{schema}.{table} is a remote Databricks table – its rows aren't in the local database. Profile it on Databricks "
+def remote_hint(schema: str, table: str, platform: str = "remote") -> str:
+    return (f"{schema}.{table} is a {platform} table – its rows aren't in the local database. Profile it remotely "
             f"(⚡ Profile / bearings profile -t {schema}.{table}), or copy a sample with:  bearings pull {schema}.{table} --rows 100000")
 
 
 def _use_remote(tb, remote: bool) -> bool:
     """Local first: a cached (or local) table runs in DuckDB unless Remote is asked for; a table that isn't
-    cached can only run on Databricks."""
+    cached can only run remotely."""
     return catalog.is_remote(tb) or bool(remote and tb.get("remote"))
 
 
 def _source(tb, remote_used: bool) -> dict:
     if remote_used:
-        return {"source": "remote"}
+        return {"source": "remote", "platform": (tb.get("remote") or {}).get("platform")}
     if tb.get("storage") == "sample":
         c = (tb.get("remote") or {}).get("cache") or {}
         return {"source": "sample", "cached_rows": c.get("rows"), "total_rows": c.get("total")}
@@ -102,7 +104,7 @@ def _source(tb, remote_used: bool) -> dict:
 def _local_or_409(tb):
     """Row-level features need the rows in DuckDB (live remote queries are a later phase)."""
     if catalog.is_remote(tb):
-        raise HTTPException(409, remote_hint(tb["schema"], tb["table"]))
+        raise HTTPException(409, remote_hint(tb["schema"], tb["table"], (tb.get("remote") or {}).get("platform") or "remote"))
     return tb
 
 
@@ -132,8 +134,11 @@ def stats(schemas: str | None = None):
         d["tables"] += 1
         d["columns"] += len(t["columns"])
         d["rows"] += t["row_count"] or 0
+    from .remote.connectors import platform
     for a, src in srcs.items():
+        p = platform(src["connection"])
         per[a].update(kind="remote", connection=src["connection"], catalog=src["catalog"], remote_schema=src["schema"],
+                      platform=p["label"], compute_label=p["compute_label"],
                       synced_at=str(src["synced_at"]) if src["synced_at"] else None)
     for d in per.values():
         d.setdefault("kind", "local")
@@ -153,7 +158,7 @@ def tables(schemas: str | None = None):
 @app.get("/api/search")
 def search(q: str, mode: str = "name", exact: bool = False, match: str = "fuzzy", columns_only: bool = False,
            schemas: str | None = None, remote: bool = False, max_remote: int = 50):
-    """remote=true (value mode): also scan remote tables in scope live on Databricks (one query per table)."""
+    """remote=true (value mode): also scan remote tables in scope live on their platform (one query per table)."""
     if not q.strip():
         return {"query": q, "mode": mode, "has_column_matches": False, "tables": []}
     if match not in ("exact", "contains", "fuzzy"):
@@ -163,7 +168,7 @@ def search(q: str, mode: str = "name", exact: bool = False, match: str = "fuzzy"
         t0 = time.time()
         res = (catalog.search_values(con, cat, q, exact=exact) if mode == "value"
                else catalog.search(cat, q, match=match, columns_only=columns_only))
-    if mode == "value":  # hits in a cached sample may miss rows that only exist on Databricks
+    if mode == "value":  # hits in a cached sample may miss rows that only exist remotely
         for t in res["tables"]:
             if t.get("storage") == "sample":
                 t["partial"] = True
@@ -179,7 +184,7 @@ def search(q: str, mode: str = "name", exact: bool = False, match: str = "fuzzy"
             hits = found.get((tb["schema"], tb["table"]))
             if hits:
                 by = {c["column"]: c for c in tb["columns"]}
-                matched = [{**catalog._col_summary(by[h["column"]]), "score": 100, "matched_by": "value (live on Databricks)",
+                matched = [{**catalog._col_summary(by[h["column"]]), "score": 100, "matched_by": f"value (live on {tb['remote'].get('platform') or 'remote'})",
                             "hits": h["hits"], "examples": h["examples"], "live": True} for h in hits]
                 matched.sort(key=lambda x: -x["hits"])
                 live[(tb["schema"], tb["table"])] = {**catalog._table_summary(tb), "score": 100, "table_score": 0, "table_matched_by": None,
@@ -395,7 +400,7 @@ def lookup(body: dict = Body(...)):
             try:
                 res.update(rq.lookup(src, tbl_name, cols_t, op, values, limit))
             except Exception as e:
-                res.update(error=f"Databricks: {str(e).splitlines()[0]}", count=0, rows=[])
+                res.update(error=f"{getattr(e, 'platform', None) or src.get('platform') or 'Remote'}: {str(e).splitlines()[0]}", count=0, rows=[])
     return jsonable({"op": op, "values": values, "limit": limit, "results": out})
 
 
@@ -433,7 +438,7 @@ def overlap(left: str, right: str):
             a_sql, a_p, a_full = relationships._values(con, ls, lt, lc, local)
             b_sql, b_p, b_full = relationships._values(con, rs, rt, rc, local)
         except relationships.NoValues as e:
-            raise HTTPException(409, f"{e} is a remote column without a key fingerprint. Profile its table on Databricks first "
+            raise HTTPException(409, f"{e} is a remote column without a key fingerprint. Profile its table remotely first "
                                      f"(bearings profile -t {e.args[0].rsplit('.', 1)[0]}) or pull it.")
         orphans = [r[0] for r in con.execute(
             f"SELECT v FROM ({a_sql}) WHERE v NOT IN (SELECT v FROM ({b_sql})) LIMIT 10", a_p + b_p).fetchall()]
@@ -513,7 +518,7 @@ def run_sql(body: dict = Body(...)):
     if not sql:
         raise HTTPException(400, "Empty query")
     engine = body.get("engine") or "duckdb"
-    if engine.startswith("databricks:"):
+    if engine != "duckdb" and ":" in engine:  # "<type>:<connection>", e.g. databricks:dev (or remote:dev)
         from .remote import query as rq
         with ro(DB) as con:
             srcs = remote_aliases(con)
@@ -535,35 +540,205 @@ def run_sql(body: dict = Body(...)):
                 aliases = remote_aliases(con)
                 hit = next((a for a in aliases if re.search(rf"\b{re.escape(a)}\s*\.", sql, re.I)), None)
                 if hit:
-                    msg += (f"\n\n'{hit}' is a remote Databricks schema: its rows aren't in the local database. "
-                            f"Switch the engine to Databricks to query it live, or copy a sample with  bearings pull {hit}.<table> --rows 100000")
+                    from .remote.connectors import platform
+                    lbl = platform(aliases[hit]["connection"])["label"]
+                    msg += (f"\n\n'{hit}' is a remote {lbl} schema: its rows aren't in the local database. "
+                            f"Switch the engine to {lbl} to query it live, or copy a sample with  bearings pull {hit}.<table> --rows 100000")
             raise HTTPException(400, msg)
     truncated = len(rows) > limit
     return jsonable({"columns": cols, "types": types, "rows": rows[:limit], "truncated": truncated,
                      "elapsed_ms": round((time.time() - t0) * 1000)})
 
 
-# ---------------------------------------------------------------- remote (Databricks) sources
+# ---------------------------------------------------------------- background jobs (load, remote sync / profile / pull)
 _jobs: dict[str, dict] = {}
 _jobs_lock = threading.Lock()
 
 
-def _remote_enabled() -> bool:
+@app.get("/api/jobs/{job_id}")
+def job_status(job_id: str):
+    job = _jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "No such job")
+    return jsonable(job)
+
+
+# ---------------------------------------------------------------- add data from the app (local files)
+LOCAL_CLIENTS = {"127.0.0.1", "::1", "localhost", "testclient"}
+
+
+def _local_only(request: Request):
+    """Reading paths on this machine is for the person at it: refuse when the app is served to others (--host 0.0.0.0)."""
+    host = request.client.host if request.client else ""
+    if host not in LOCAL_CLIENTS and os.environ.get("BEARINGS_ALLOW_REMOTE_PATHS") != "1":
+        raise HTTPException(403, "Loading from a path works only in a browser on the machine running Bearings – drop the files instead")
+
+
+def _load_source(request: Request, body: dict) -> tuple[Path, bool]:
+    from . import ingest
+    if body.get("upload"):
+        try:
+            d = ingest.upload_dir(DB, body["upload"])
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        if not d.exists():
+            raise HTTPException(404, "Upload not found (it may have been removed)")
+        while True:  # a dropped folder: load the folder itself (its name suggests the schema)
+            kids = [k for k in d.iterdir() if not k.name.startswith(".")]
+            if len(kids) == 1 and kids[0].is_dir():
+                d = kids[0]
+                continue
+            return d, True
+    raw = (body.get("path") or "").strip().strip('"').strip("'")
+    if not raw:
+        raise HTTPException(400, "Give a file or folder path, or drop files")
+    _local_only(request)
+    p = Path(os.path.expanduser(raw))
+    if not p.exists():
+        raise HTTPException(404, f"Not found: {p}")
+    return p, False
+
+
+def _load_opts(body: dict):
+    from .loaders import LoadOptions
+    sheets = body.get("sheets") or []
+    if isinstance(sheets, str):
+        sheets = [x.strip() for x in sheets.split(",") if x.strip()]
+    hr = body.get("header_row")
+    return LoadOptions(all_varchar=bool(body.get("all_varchar")), delim=body.get("delim") or None, sheets=sheets,
+                       header_row=int(hr) if hr not in (None, "") else None)
+
+
+@app.get("/api/load/formats")
+def load_formats():
+    from .loaders import readers
+    return [{"name": r.name, "label": r.label, "extensions": list(r.extensions), "available": r.available(),
+             "folder_as_table": r.folder_as_table} for r in readers()]
+
+
+@app.get("/api/load/ls")
+def load_ls(request: Request, path: str | None = None):
+    """Folder picker: sub-folders and loadable files of a folder on this machine."""
+    from . import ingest
+    _local_only(request)
     try:
-        import databricks.sdk  # noqa: F401
-        import databricks.sql  # noqa: F401
-        return True
-    except ImportError:
+        return ingest.listdir(path)
+    except (FileNotFoundError, PermissionError) as e:
+        raise HTTPException(404, str(e))
+
+
+@app.post("/api/load/upload")
+async def load_upload(request: Request, batch: str, name: str):
+    """Receive one dropped file (raw body) into data/uploads/<batch>/<name>. A dropped folder keeps its sub-folders,
+    so a folder of part-files still becomes one table."""
+    from . import ingest
+    try:
+        dest = ingest.upload_dir(DB, batch) / ingest.safe_relpath(name)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    n = 0
+    with open(dest, "wb") as f:
+        async for chunk in request.stream():
+            f.write(chunk)
+            n += len(chunk)
+    return {"batch": batch, "name": str(ingest.safe_relpath(name)), "bytes": n}
+
+
+@app.post("/api/load/preview")
+def load_preview(request: Request, body: dict = Body(...)):
+    """What loading `path` (or an upload batch) would create. body = {path | upload, sheets?, header_row?}"""
+    from . import ingest
+    src, is_upload = _load_source(request, body)
+    try:
+        res = ingest.preview(src, _load_opts(body), is_upload=is_upload)
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+    if is_upload:  # show the dropped names, not the server-side folder
+        root = str(src) + os.sep
+        for it in res["items"]:
+            it["source"] = it["source"].replace(root, "")
+        res["comments_display"] = [c.replace(root, "") for c in res["comments"]]
+        res["path"] = None
+    existing = set()
+    if DB.exists():
+        with ro(DB) as con:
+            existing = {(s_, t) for s_, t in con.execute(
+                "SELECT table_schema, table_name FROM information_schema.tables WHERE table_catalog = current_database()").fetchall()}
+    res["existing"] = sorted(f"{s_}.{t}" for s_, t in existing)
+    return jsonable(res)
+
+
+def _run_load_job(job_id: str, src: Path, schema: str, opts, body: dict):
+    from . import ingest
+    job = _jobs[job_id]
+    try:
+        comments = [c for c in body.get("comments") or [] if Path(c).resolve().is_relative_to(src.resolve())] if src.is_dir() \
+            else [c for c in body.get("comments") or [] if Path(c) == src]
+        res = ingest.run(DB, src, schema, opts, mode="append" if body.get("mode") == "append" else "replace",
+                         tables=body.get("tables"), comments=comments, profile=body.get("profile", True) is not False,
+                         relate=body.get("relate", True) is not False, progress=lambda p: job.update(p))
+        job["results"] = res["loaded"]
+        job["errors"] = res["errors"]
+        job["summary"] = {k: res[k] for k in ("schema", "comments", "profiled", "relationships", "seconds")}
+        job["status"] = "failed" if res["errors"] and not res["loaded"] else "done"
+    except Exception as e:  # noqa: BLE001 - report anything to the UI
+        job["errors"].append({"table": "", "error": str(e).splitlines()[0] if str(e) else type(e).__name__})
+        job["status"] = "failed"
+    catalog._cache["key"] = None
+    job.update(current=None, finished_at=dt.datetime.now().isoformat(timespec="seconds"))
+
+
+@app.post("/api/load")
+def load_data(request: Request, body: dict = Body(...)):
+    """Load files into DuckDB in the background, then profile them and look for relationships.
+    body = {path | upload, schema, mode?: replace|append, tables?: [...], comments?: [...], all_varchar?, delim?,
+            sheets?, header_row?, profile?: true, relate?: true, wait?: false}"""
+    src, _ = _load_source(request, body)
+    schema = (body.get("schema") or "").strip() or "main"
+    if schema.startswith("_") or schema.lower() in ("information_schema", "pg_catalog"):
+        raise HTTPException(400, f"'{schema}' is reserved – pick another schema name")
+    with ro(DB) if DB.exists() else _nullctx() as con:
+        if con is not None and schema in remote_aliases(con):
+            raise HTTPException(400, f"'{schema}' is an attached remote schema – load into another schema")
+    with _jobs_lock:
+        if any(j["status"] == "running" and j.get("kind") == "load" for j in _jobs.values()):
+            raise HTTPException(409, "Another load is still running – wait for it to finish")
+        job_id = uuid.uuid4().hex[:12]
+        _jobs[job_id] = {"id": job_id, "kind": "load", "schema": schema, "status": "running", "phase": "load", "current": None,
+                         "done": 0, "total": 0, "results": [], "errors": [], "started_at": dt.datetime.now().isoformat(timespec="seconds")}
+    args = (job_id, src, schema, _load_opts(body), body)
+    if body.get("wait"):
+        _run_load_job(*args)
+    else:
+        threading.Thread(target=_run_load_job, args=args, daemon=True).start()
+    return jsonable(_jobs[job_id])
+
+
+class _nullctx:
+    def __enter__(self):
+        return None
+
+    def __exit__(self, *a):
         return False
+
+
+# ---------------------------------------------------------------- remote sources (connectors: Databricks, …)
+
+
+def _remote_enabled() -> bool:
+    """Is at least one remote connector's extra installed?"""
+    from .remote.connectors import any_installed
+    return any_installed()
 
 
 @app.get("/api/remote")
 def remote_overview():
     """Attached remote schemas, known connection profiles and running sync jobs."""
     from .remote import connections as cx
+    from .remote import connectors
     try:
-        conns = [{"name": c.name, "host": c.host, "warehouse_id": c.warehouse_id, "profile": c.profile}
-                 for c in cx.load_all().values()]
+        conns = [c.connector.public_info() for c in cx.load_all().values()]
     except Exception as e:  # a broken connections.toml shouldn't break the app
         conns, err = [], str(e)
     else:
@@ -589,7 +764,8 @@ def remote_overview():
                                 "profiled": pn, "stale": ps})
     with _jobs_lock:
         running = [j for j in _jobs.values() if j["status"] == "running"]
-    return jsonable({"enabled": _remote_enabled(), "connections": conns, "connections_error": err,
+    types = [{"type": t, "label": cls.label, "installed": cls.installed(), "extra": cls.extra} for t, cls in connectors.types().items()]
+    return jsonable({"enabled": _remote_enabled(), "connections": conns, "connections_error": err, "types": types,
                      "sources": sources, "running_jobs": running})
 
 
@@ -738,7 +914,7 @@ def _warehouse_connections(only: str | None) -> list[str]:
         conns = cx.load_all()
     except Exception:
         return []
-    return [c for c in sorted(used) if c in conns and conns[c].warehouse_id and (not only or c == only)]
+    return [c for c in sorted(used) if c in conns and conns[c].connector.can_query() and (not only or c == only)]
 
 
 def _warm_on_start():

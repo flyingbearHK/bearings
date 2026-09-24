@@ -75,7 +75,7 @@ def build(con, db_path: Path) -> dict:
 
 
 def _add_remote(con, tables: dict, comments: dict, prof: dict, tprof: dict, ann: dict) -> None:
-    """Merge attached Databricks schemas (metadata only). A pulled local copy with the same name wins,
+    """Merge attached remote schemas (metadata only). A pulled local copy with the same name wins,
     because it has rows; it keeps a pointer to its remote source."""
     srcs = remote_aliases(con)
     if not srcs or not has_meta(con, "remote_tables"):
@@ -101,11 +101,18 @@ def _add_remote(con, tables: dict, comments: dict, prof: dict, tprof: dict, ann:
                              "checked_at": str(x["checked_at"]) if x.get("checked_at") else None,
                              "outdated": bool(x.get("latest_version") is not None and x.get("source_version") is not None
                                               and x["latest_version"] > x["source_version"])}
+    from .remote.connectors import platform
+    plat = {}
     for a, t, ttype, tcm, rows, upd, synced in rt:
         src = srcs.get(a)
         if not src:
             continue
-        info = {"connection": src["connection"], "catalog": src["catalog"], "schema": src["schema"], "table": t,
+        if src["connection"] not in plat:
+            plat[src["connection"]] = platform(src["connection"])
+        p = plat[src["connection"]]
+        info = {"connection": src["connection"], "platform": p["label"], "platform_type": p["type"],
+                "compute_label": p["compute_label"], "version_label": p["version_label"],
+                "catalog": src["catalog"], "schema": src["schema"], "table": t,
                 "full_name": f"{src['catalog']}.{src['schema']}.{t}", "table_type": ttype,
                 "updated_at": str(upd) if upd else None, "synced_at": str(synced) if synced else None}
         k = (a, t)
@@ -124,7 +131,7 @@ def _add_remote(con, tables: dict, comments: dict, prof: dict, tprof: dict, ann:
         tables[k] = {"schema": a, "table": t, "columns": [], "row_count": (tprof.get(k) or {}).get("row_count") or rows,
                      "profiled": k in tprof, "profiled_at": (tprof.get(k) or {}).get("profiled_at"),
                      "candidate_keys": (tprof.get(k) or {}).get("candidate_keys", []),
-                     "source": f"databricks://{src['connection']}/{info['full_name']}", "loaded_at": None,
+                     "source": f"{p['type']}://{src['connection']}/{info['full_name']}", "loaded_at": None,
                      "comment": comments.get((a, t, "")) or tcm, "annotation": ann.get((a, t, "")),
                      "kind": "remote", "storage": "remote", "remote": info | {"pulled": False}}
         for c, o, dtp, cm in rc.get(k, []):

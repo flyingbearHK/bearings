@@ -26,7 +26,7 @@ export const api = {
   annotations: (schemas) => req(`/api/annotations?${qs({ schemas })}`),
   saveAnnotation: (a) => req('/api/annotations', { method: 'PUT', body: JSON.stringify(a) }),
   sql: (sql, limit, engine) => req('/api/sql', { method: 'POST', body: JSON.stringify({ sql, limit, engine }) }),
-  // remote (Databricks) sources
+  // remote sources (connectors: Databricks, …)
   remote: () => req('/api/remote'),
   remoteSync: (body) => req('/api/remote/sync', { method: 'POST', body: JSON.stringify(body) }),
   remoteJob: (id) => req(`/api/remote/jobs/${enc(id)}`),
@@ -35,6 +35,12 @@ export const api = {
   remotePull: (body) => req('/api/remote/pull', { method: 'POST', body: JSON.stringify(body) }),
   remoteProfile: (body) => req('/api/remote/profile', { method: 'POST', body: JSON.stringify(body) }),
   remoteChanges: (alias, limit) => req(`/api/remote/changes?${qs({ alias, limit })}`),
+  // jobs + adding local data
+  job: (id) => req(`/api/jobs/${enc(id)}`),
+  loadFormats: () => req('/api/load/formats'),
+  loadLs: (path) => req(`/api/load/ls?${qs({ path })}`),
+  loadPreview: (body) => req('/api/load/preview', { method: 'POST', body: JSON.stringify(body) }),
+  load: (body) => req('/api/load', { method: 'POST', body: JSON.stringify(body) }),
   orphans: (schemas) => req(`/api/annotations/orphans?${qs({ schemas })}`),
   remap: (body) => req('/api/annotations/remap', { method: 'POST', body: JSON.stringify(body) }),
 }
@@ -68,13 +74,44 @@ export const ago = (ts) => {
   return `${Math.round(d / 86400)} d ago`
 }
 
-/** Where a table's rows live: local (loaded file), cached (complete local copy of a Databricks table),
- *  sample (local sample, whole table on Databricks), remote (Databricks only). */
+/** Where a table's rows live: local (loaded file), cached (complete local copy of a remote table),
+ *  sample (local sample, whole table remote), remote (remote only, e.g. Databricks). */
 export const STORAGE = {
-  cached: { chip: 'good', label: '● cached', title: 'Complete local copy of the Databricks table: queries run locally' },
-  sample: { chip: 'warn', label: '◐ remote/cached', title: 'A random sample is cached locally (queries run on it); the whole table is on Databricks – tick ⚡ Remote for it' },
-  remote: { chip: 'cloud', label: '☁ remote', title: 'Not cached: queries run on the Databricks SQL warehouse' },
+  cached: { chip: 'good', label: '● cached', title: 'Complete local copy of the remote table: queries run locally' },
+  sample: { chip: 'warn', label: '◐ remote/cached', title: 'A random sample is cached locally (queries run on it); the whole table is remote – tick ⚡ Remote for it' },
+  remote: { chip: 'cloud', label: '☁ remote', title: 'Not cached: queries run live on the remote source (e.g. the Databricks SQL warehouse)' },
 }
-export const sourceNote = (r) => r?.source === 'remote' ? `⚡ live from Databricks${r.elapsed_ms != null ? ` in ${fmt.n(r.elapsed_ms)} ms` : ''}`
+export const sourceNote = (r) => r?.source === 'remote' ? `⚡ live from ${r.platform || 'the remote source'}${r.elapsed_ms != null ? ` in ${fmt.n(r.elapsed_ms)} ms` : ''}`
   : r?.source === 'sample' ? `from the cached sample${r.cached_rows ? ` (${fmt.n(r.cached_rows)} of ${fmt.n(r.total_rows)} rows)` : ''}`
     : r?.source === 'cached' ? 'from the local cache' : ''
+
+/** Copy text to the clipboard and show a short confirmation. */
+export const copy = (text, what = 'Copied') => {
+  const done = () => window.dispatchEvent(new CustomEvent('bearings:toast', { detail: `${what}: ${String(text).slice(0, 60)}` }))
+  try { navigator.clipboard.writeText(String(text)).then(done, done) } catch { done() }
+}
+
+/** Recently opened tables (most recent first), kept in the browser. */
+export const recent = {
+  get: () => store.get('recent', []),
+  add(schema, table) {
+    const k = `${schema}.${table}`
+    store.set('recent', [k, ...recent.get().filter((x) => x !== k)].slice(0, 12))
+  },
+}
+
+/** Split text around case-insensitive matches of `term` → [{t, hit}] (for <mark> highlighting). */
+export const splitHits = (text, term) => {
+  if (!term || text == null) return [{ t: String(text ?? ''), hit: false }]
+  const s = String(text), low = s.toLowerCase(), q = String(term).toLowerCase()
+  if (!q || !low.includes(q)) return [{ t: s, hit: false }]
+  const out = []
+  let i = 0, j
+  while ((j = low.indexOf(q, i)) !== -1) {
+    if (j > i) out.push({ t: s.slice(i, j), hit: false })
+    out.push({ t: s.slice(j, j + q.length), hit: true })
+    i = j + q.length
+  }
+  if (i < s.length) out.push({ t: s.slice(i), hit: false })
+  return out
+}

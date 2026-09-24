@@ -11,6 +11,7 @@ pa = pytest.importorskip("pyarrow", reason="remote mode needs: uv sync --extra d
 from typer.testing import CliRunner
 
 from bearings.remote import connections as cx
+from bearings.remote.connectors import databricks as dbx
 
 # ------------------------------------------------------------------ fake Databricks
 
@@ -120,8 +121,8 @@ def env(tmp_path, monkeypatch):
     db = tmp_path / "data" / "t.duckdb"
     monkeypatch.setenv("BEARINGS_DB", str(db))
     uc, sql_log = FakeUC(), []
-    monkeypatch.setattr(cx, "workspace_client_factory", lambda conn: uc)
-    monkeypatch.setattr(cx, "sql_connect_factory", lambda conn, client, *a: FakeSQL(sql_log))
+    monkeypatch.setattr(dbx, "workspace_client_factory", lambda conn: uc)
+    monkeypatch.setattr(dbx, "sql_connect_factory", lambda conn, client, *a: FakeSQL(sql_log))
     from bearings.remote import query as rq
     rq.close_all()
     cx.reset_clients()
@@ -143,7 +144,7 @@ def test_connection_profiles(env):
     r = env.run("remote", "add", "dev", "--host", "https://adb-1.azuredatabricks.net/", "--warehouse", "wh1")
     assert r.exit_code == 0, r.output
     c = cx.get("dev")
-    assert c.hostname == "adb-1.azuredatabricks.net" and c.http_path == "/sql/1.0/warehouses/wh1"
+    assert dbx.hostname(c) == "adb-1.azuredatabricks.net" and dbx.http_path(c) == "/sql/1.0/warehouses/wh1"
     assert "token" not in cx.config_path().read_text().lower()
     r = env.run("remote", "test", "dev", "--catalog", "lakehouse")
     assert r.exit_code == 0 and "bruce@example.com" in r.output and "bronze_opera" in r.output and "answered 1" in r.output, r.output

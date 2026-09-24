@@ -1,7 +1,7 @@
-"""Profile remote Databricks tables on the SQL warehouse and keep the result in DuckDB `_meta`.
+"""Profile remote tables on their SQL engine (Databricks: the SQL warehouse) and keep the result in DuckDB `_meta`.
 
 For each table:
-1. `count(*)` (a Delta metadata read).
+1. `count(*)` (on Databricks a Delta metadata read).
 2. A sample (the whole table when it's small) streams into an in-memory DuckDB and goes through the
    same profiler as local tables: top values, patterns, histograms, PII hints, flags.
 3. For tables bigger than the sample, one aggregate query per 25 columns gets the *exact* row, null
@@ -26,6 +26,7 @@ from ..db import META, connect, has_meta, qi, remote_aliases, ro, user_tables
 from ..relationships import ID_SUFFIX
 from . import RemoteError
 from . import connections as cx
+from .connectors import Dialect, dialect_for, type_family
 from .pull import build_sql
 from .sync import remote_fq
 
@@ -33,23 +34,7 @@ DEFAULT_SAMPLE = 200_000
 KEY_CAP = 500_000
 
 
-def spark_family(t: str) -> str:
-    u = (t or "").strip().upper()
-    if re.match(r"^(ARRAY|MAP|STRUCT|VARIANT|BINARY|INTERVAL|OBJECT|GEOGRAPHY|GEOMETRY|VOID)", u):
-        return "other"
-    if u == "BOOLEAN":
-        return "bool"
-    if re.match(r"^(DATE|TIMESTAMP)", u):
-        return "temporal"
-    if re.match(r"^(STRING|VARCHAR|CHAR)", u):
-        return "string"
-    if re.match(r"^(TINYINT|SMALLINT|INT|INTEGER|BIGINT|LONG|SHORT|BYTE|FLOAT|DOUBLE|REAL|DECIMAL|DEC|NUMERIC)", u):
-        return "numeric"
-    return "other"
-
-
-def bq(name: str) -> str:
-    return "`" + name.replace("`", "``") + "`"
+spark_family = type_family   # old name, kept for imports from earlier versions
 
 
 def _is_keyish(p: dict) -> bool:
@@ -92,20 +77,20 @@ def targets(db_path: Path, aliases: list[str] | None = None, tables: list[str] |
     return out
 
 
-def _exact_stats(cur, src: str, cols: list[tuple[str, str]]) -> dict[str, dict]:
+def _exact_stats(cur, src: str, cols: list[tuple[str, str]], d: Dialect) -> dict[str, dict]:
     """One pass over the whole remote table per 25 columns: non-null, blank, approx distinct, min, max."""
     out: dict[str, dict] = {}
     for i in range(0, len(cols), 25):
         chunk = cols[i:i + 25]
         exprs = []
         for c, t in chunk:
-            f, q = spark_family(t), bq(c)
+            f, q = d.type_family(t), d.quote(c)
             if f == "other":
                 exprs += [f"count({q})", "NULL", "NULL", "NULL", "NULL"]
                 continue
-            exprs += [f"count({q})", f"approx_count_distinct({q})", f"CAST(min({q}) AS STRING)", f"CAST(max({q}) AS STRING)",
-                      f"count_if(trim({q}) = '')" if f == "string" else "NULL"]
-        # every expression needs its own name: Databricks returns Arrow, which rejects duplicate column names (e.g. several NULLs)
+            exprs += [f"count({q})", d.approx_distinct(q), d.cast_string(f"min({q})"), d.cast_string(f"max({q})"),
+                      d.blank_count(q) if f == "string" else "NULL"]
+        # every expression needs its own name: results come back as Arrow, which rejects duplicate column names (e.g. several NULLs)
         cur.execute("SELECT " + ", ".join(f"{e} AS _c{k}" for k, e in enumerate(exprs)) + f" FROM {src}")
         row = list(cur.fetchone())
         for j, (c, t) in enumerate(chunk):
@@ -115,22 +100,22 @@ def _exact_stats(cur, src: str, cols: list[tuple[str, str]]) -> dict[str, dict]:
     return out
 
 
-def _exact_distinct(cur, src: str, cols: list[str]) -> dict[str, int]:
+def _exact_distinct(cur, src: str, cols: list[str], d: Dialect) -> dict[str, int]:
     out = {}
     for i in range(0, len(cols), 25):
         chunk = cols[i:i + 25]
-        cur.execute("SELECT " + ", ".join(f"count(DISTINCT {bq(c)}) AS _d{k}" for k, c in enumerate(chunk)) + f" FROM {src}")
+        cur.execute("SELECT " + ", ".join(f"count(DISTINCT {d.quote(c)}) AS _d{k}" for k, c in enumerate(chunk)) + f" FROM {src}")
         for c, n in zip(chunk, list(cur.fetchone())):
             out[c] = int(n or 0)
     return out
 
 
-def _remote_key_values(cur, src: str, cols: list[str], cap: int) -> dict[str, list[str]]:
-    """Distinct values of key columns straight from the warehouse (for tables bigger than the sample)."""
+def _remote_key_values(cur, src: str, cols: list[str], cap: int, d: Dialect) -> dict[str, list[str]]:
+    """Distinct values of key columns straight from the remote engine (for tables bigger than the sample)."""
     out: dict[str, list[str]] = {c: [] for c in cols}
     for c in cols:
-        q = bq(c)
-        cur.execute(f"SELECT DISTINCT CAST({q} AS STRING) AS v FROM {src} WHERE {q} IS NOT NULL LIMIT {cap + 1}")
+        q = d.quote(c)
+        cur.execute(f"SELECT DISTINCT {d.cast_string(q)} AS v FROM {src} WHERE {q} IS NOT NULL LIMIT {cap + 1}")
         while True:
             b = cur.fetchmany_arrow(100_000)
             if b is None or b.num_rows == 0:
@@ -140,7 +125,7 @@ def _remote_key_values(cur, src: str, cols: list[str], cap: int) -> dict[str, li
 
 
 def widen_decimals(tbl):
-    """Arrow DECIMAL(p,s) -> DECIMAL(38,s). Values from Databricks can exceed a column's declared precision
+    """Arrow DECIMAL(p,s) -> DECIMAL(38,s). Values from Databricks (or another remote engine) can exceed a column's declared precision
     (e.g. 183823530.0 in DECIMAL(18,10)); DuckDB then fails on arithmetic that stays in the declared type.
     Returns (table, {column: declared type} for columns whose values really exceed their declared precision)."""
     import pyarrow as pa
@@ -175,6 +160,7 @@ def profile_table(db_path: Path, alias: str, table: str, sample_rows: int = DEFA
     if not rcols:
         raise RemoteError(f"No columns known for {alias}.{table} – run `bearings sync -s {alias}` first")
     conn = cx.get(src_info["connection"])
+    d = dialect_for(conn.name)
     src = remote_fq(src_info, table)
     step = "connect"
     from . import query as rq
@@ -202,10 +188,10 @@ def profile_table(db_path: Path, alias: str, table: str, sample_rows: int = DEFA
                 exact: dict = {}
                 if sampled:
                     step = "whole-table statistics"
-                    exact = _exact_stats(cur, src, rcols)
+                    exact = _exact_stats(cur, src, rcols, d)
                     maybe_unique = [p["column_name"] for p in cols
                                     if (e := exact.get(p["column_name"])) and e["nn"] and e["dist"] is not None and e["dist"] >= 0.95 * e["nn"]]
-                    exact_dist = _exact_distinct(cur, src, maybe_unique) if maybe_unique else {}
+                    exact_dist = _exact_distinct(cur, src, maybe_unique, d) if maybe_unique else {}
                     for p in cols:
                         e = exact.get(p["column_name"])
                         if not e:
@@ -232,7 +218,7 @@ def profile_table(db_path: Path, alias: str, table: str, sample_rows: int = DEFA
                             keys[c] = [r[0] for r in mem.execute(
                                 f"SELECT DISTINCT CAST({qi(c)} AS VARCHAR) FROM {qi(alias)}.{qi(table)} WHERE {qi(c)} IS NOT NULL LIMIT {key_cap + 1}").fetchall()]
                     elif kc:
-                        keys = _remote_key_values(cur, src, kc, key_cap)
+                        keys = _remote_key_values(cur, src, kc, key_cap, d)
                     for c in list(keys):
                         complete[c] = len(keys[c]) <= key_cap
                         keys[c] = keys[c][:key_cap]
@@ -313,7 +299,7 @@ def fingerprinted(con) -> dict[tuple[str, str, str], bool]:
 
 def profile_many(db_path: Path, targets: list[tuple[str, str]], sample_rows: int = DEFAULT_SAMPLE, top_n: int = 10,
                  fingerprints: bool = True, echo=lambda *_: None) -> tuple[int, int]:
-    """Profile several remote tables, 3 at a time on pooled warehouse sessions. Returns (ok, failed)."""
+    """Profile several remote tables, 3 at a time on pooled sessions. Returns (ok, failed)."""
     from concurrent.futures import ThreadPoolExecutor
 
     from .pull import PARALLEL

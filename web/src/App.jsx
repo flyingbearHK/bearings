@@ -1,5 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { api, exportUrl, fmt, store } from './api.js'
+import { api, exportUrl, fmt, recent, store } from './api.js'
+import AddData, { filesFromDrop } from './components/AddData.jsx'
+import QuickOpen, { ShortcutHelp } from './components/QuickOpen.jsx'
 import ScopePicker from './components/ScopePicker.jsx'
 import ProfileDrawer from './components/ProfileDrawer.jsx'
 import { ColumnPane, TablePane } from './components/Results.jsx'
@@ -12,6 +14,27 @@ const FILTER_RE = /^\s*([^=<>!~]+?)\s*(>=|<=|!=|=|>|<|~)\s*(.+?)\s*$/
 export function parseFilter(q) {
   const m = q.match(FILTER_RE)
   return m && m[1].trim() && m[3].trim() ? { column: m[1].trim(), op: m[2], value: m[3].trim() } : null
+}
+
+const isMac = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent)
+const MOD = isMac ? '⌘' : 'Ctrl'
+
+function sortTables(list, how) {
+  if (!how || how === 'relevance') return list
+  const by = {
+    name: (a, b) => a.table.localeCompare(b.table) || a.schema.localeCompare(b.schema),
+    rows: (a, b) => (b.row_count ?? -1) - (a.row_count ?? -1),
+    columns: (a, b) => (b.column_count ?? b.columns?.length ?? 0) - (a.column_count ?? a.columns?.length ?? 0),
+    schema: (a, b) => a.schema.localeCompare(b.schema) || a.table.localeCompare(b.table),
+  }[how]
+  return by ? [...list].sort(by) : list
+}
+
+/** The part of the query worth highlighting: no wildcards, the column part of table.column / column=value. */
+function highlightTerm(q, mode, filter) {
+  if (mode === 'value') return q.trim()
+  const t = (filter ? filter.column : q).replace(/\*/g, '').trim()
+  return t.includes('.') ? t.split('.').pop() : t
 }
 
 export default function App() {
@@ -42,6 +65,13 @@ export default function App() {
   scopeRef.current = scopeParam
   const inputRef = useRef(null)
   const seq = useRef(0)
+  const [tableSort, setTableSortState] = useState(() => store.get('tableSort', 'relevance'))
+  const setTableSort = (v) => { setTableSortState(v); store.set('tableSort', v) }
+  const [adding, setAdding] = useState(null)   // null | {files?: [...]} – the Add data dialog
+  const [palette, setPalette] = useState(false)
+  const [help, setHelp] = useState(false)
+  const [toast, setToast] = useState(null)
+  const [dragging, setDragging] = useState(false)
 
   const loadMeta = useCallback(() => {
     api.stats(scopeRef.current).then(setStats).catch((e) => setError(e.message))
@@ -61,13 +91,30 @@ export default function App() {
     loadMeta()
   }
   useEffect(() => { store.set('workshop', workshop); document.body.classList.toggle('workshop', workshop) }, [workshop])
+  // toasts (e.g. "Copied") from anywhere
   useEffect(() => {
-    const h = (e) => {
-      if (e.key === '/' && !['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName)) { e.preventDefault(); setView('explore'); inputRef.current?.focus() }
-    }
-    window.addEventListener('keydown', h)
-    return () => window.removeEventListener('keydown', h)
+    let timer
+    const h = (e) => { setToast(e.detail); clearTimeout(timer); timer = setTimeout(() => setToast(null), 1800) }
+    window.addEventListener('bearings:toast', h)
+    return () => { window.removeEventListener('bearings:toast', h); clearTimeout(timer) }
   }, [])
+  // drop files anywhere → Add data
+  useEffect(() => {
+    const hasFiles = (e) => [...(e.dataTransfer?.types || [])].includes('Files')
+    const over = (e) => { if (hasFiles(e)) { e.preventDefault(); if (!adding) setDragging(true) } }
+    const leave = (e) => { if (!e.relatedTarget || e.clientX <= 0 || e.clientY <= 0) setDragging(false) }
+    const drop = async (e) => {
+      if (!hasFiles(e)) return
+      e.preventDefault(); setDragging(false)
+      if (adding) return  // the dialog's own drop zone handles it
+      const files = await filesFromDrop(e.dataTransfer)
+      if (files.length) setAdding({ files })
+    }
+    window.addEventListener('dragover', over)
+    window.addEventListener('dragleave', leave)
+    window.addEventListener('drop', drop)
+    return () => { window.removeEventListener('dragover', over); window.removeEventListener('dragleave', leave); window.removeEventListener('drop', drop) }
+  }, [adding])
 
   const filter = mode === 'name' ? parseFilter(q) : null
   const effMatch = mode === 'value' && match === 'fuzzy' ? 'contains' : match
@@ -125,7 +172,8 @@ export default function App() {
   const canLookup = !!lookupFilter && !!results && nCheckedInResults > 0
   const lookupHint = mode === 'value' ? 'Run the value search first (Enter)' : 'Type column=value in the search box, e.g. reservationid=9401'
 
-  const list = results ? results.tables : allTables
+  const list = useMemo(() => sortTables(results ? results.tables : allTables, tableSort), [results, allTables, tableSort])
+  const term = highlightTerm(q, mode, filter)
   const hasCols = !!results?.has_column_matches
   const selKey = sel ? `${sel.schema}.${sel.table}` : null
   const highlight = useMemo(() => {
@@ -135,6 +183,74 @@ export default function App() {
 
   const openTable = (schema, table, column = null, t = 'columns') => {
     setView('explore'); setPanel('detail'); setSel({ schema, table }); setSelCol(column); setTab(t)
+  }
+  // remember a table once it has been looked at for a moment (not every table passed with the arrow keys)
+  useEffect(() => {
+    if (!sel) return
+    const h = setTimeout(() => recent.add(sel.schema, sel.table), 1500)
+    return () => clearTimeout(h)
+  }, [selKey]) // eslint-disable-line
+
+  // keyboard: ↑/↓ tables, ⇧↑/⇧↓ matched columns, x tick, 1-4 tabs, s sample, a add data, ? help, ⌘/Ctrl+K jump
+  const matchedCols = useMemo(() => (results?.tables || []).flatMap((r) => (r.matched_columns || []).map((c) => ({ r, c }))), [results])
+  useEffect(() => {
+    const h = (e) => {
+      const el = document.activeElement
+      const inSearch = el === inputRef.current
+      const inField = ['INPUT', 'TEXTAREA', 'SELECT'].includes(el?.tagName) || el?.isContentEditable
+      if ((e.metaKey || e.ctrlKey) && !e.altKey && e.key.toLowerCase() === 'k') { e.preventDefault(); setPalette((x) => !x); return }
+      if (palette || help || adding || e.metaKey || e.ctrlKey || e.altKey) return
+      if (inField && !inSearch) return
+      if (e.key === '/' && !inSearch) { e.preventDefault(); setView('explore'); inputRef.current?.focus(); return }
+      if (inSearch && !['ArrowDown', 'ArrowUp', 'Escape'].includes(e.key)) return
+      if (e.key === '?') { e.preventDefault(); setHelp(true); return }
+      if (e.key === 'a') { e.preventDefault(); setAdding({}); return }
+      if (view !== 'explore') return
+      const move = (d) => {
+        if (e.shiftKey && matchedCols.length) {
+          const at = matchedCols.findIndex(({ r, c }) => `${r.schema}.${r.table}` === selKey && c.column === selCol)
+          const nx = matchedCols[Math.max(0, Math.min(matchedCols.length - 1, at + d))]
+          if (nx) openTable(nx.r.schema, nx.r.table, nx.c.column, tab)
+          return
+        }
+        if (!list.length) return
+        const at = list.findIndex((t) => `${t.schema}.${t.table}` === selKey)
+        const nx = list[at === -1 ? 0 : Math.max(0, Math.min(list.length - 1, at + d))]
+        openTable(nx.schema, nx.table, nx.matched_columns?.[0]?.column || null, tab === 'profile' || tab === 'sample' || tab === 'rels' ? tab : 'columns')
+      }
+      switch (e.key) {
+        case 'ArrowDown': e.preventDefault(); move(1); break
+        case 'ArrowUp': e.preventDefault(); move(-1); break
+        case 'Escape':
+          if (inSearch && q) { setQ(''); setResults(null); setPanel('detail') } else if (panel === 'lookup') { setPanel('detail') } else { inputRef.current?.blur() }
+          break
+        case 'x': if (selKey) { const n = new Set(checked); n.has(selKey) ? n.delete(selKey) : n.add(selKey); setChecked(n) } break
+        case '1': case '2': case '3': case '4': if (sel) { setPanel('detail'); setTab(['columns', 'sample', 'profile', 'rels'][Number(e.key) - 1]) } break
+        case 's': if (sel) { setPanel('detail'); setTab('sample') } break
+        default:
+      }
+    }
+    window.addEventListener('keydown', h)
+    return () => window.removeEventListener('keydown', h)
+  })
+
+  const commands = [
+    { label: 'Add data (files, folder or path)…', keys: 'a', run: () => setAdding({}) },
+    { label: 'Go to Explore', run: () => setView('explore') },
+    { label: 'Go to Relationships', run: () => setView('rels') },
+    { label: 'Go to Annotations', run: () => setView('ann') },
+    { label: 'Go to SQL', run: () => setView('sql') },
+    { label: 'Search values in the data', run: () => { setView('explore'); setMode('value'); setResults(null); setTimeout(() => inputRef.current?.focus()) } },
+    { label: `${workshop ? 'Leave' : 'Enter'} workshop mode`, run: () => setWorkshop((w) => !w) },
+    ...(scope.length ? [{ label: 'Show all schemas (clear scope)', run: () => setScope([]) }] : []),
+    { label: 'Export Excel mapping workbook', run: () => { window.location.href = exportUrl('xlsx', scopeParam) } },
+    { label: 'Keyboard shortcuts', keys: '?', run: () => setHelp(true) },
+  ]
+  const onLoaded = (job) => {
+    if (scope.length && job.schema && !scope.includes(job.schema)) setScope([...scope, job.schema].sort())
+    else loadMeta()
+    setRefreshKey((k) => k + 1)
+    if (mode === 'name' && q.trim()) runSearch(q, 'name', match)
   }
   const valueSearch = (v) => {
     setDrawer(null); setView('explore'); setMode('value'); setMatch('exact'); setQ(String(v)); runSearch(String(v), 'value', 'exact')
@@ -155,6 +271,8 @@ export default function App() {
           ))}
         </nav>
         <span className="spacer" />
+        <button className="btn jump" onClick={() => setPalette(true)} title="Jump to any table or column, or run an action">⌕ <span className="jump-label">Jump to…</span> <kbd>{MOD} K</kbd></button>
+        <button className="btn" onClick={() => setAdding({})} title="Load CSV, Parquet, JSON or Excel files (or drop them anywhere) · a">＋ <span className="add-label">Add data</span></button>
         <ScopePicker schemas={stats?.schema_stats} scope={scope} setScope={setScope} onSynced={() => { loadMeta(); setRefreshKey((k) => k + 1); if (mode === 'name' && q.trim()) runSearch(q, 'name', match) }} />
         {stats?.exists && <span className="muted small stats-line">{stats.tables} tables · {fmt.n(stats.columns)} columns · {stats.profiled} profiled · {stats.relationships} relationships</span>}
         <label className="check" title="Larger text; PII columns masked in samples"><input type="checkbox" checked={workshop} onChange={(e) => setWorkshop(e.target.checked)} /> Workshop mode</label>
@@ -185,8 +303,8 @@ export default function App() {
             </span>
             {mode === 'value' && results && (results.skipped_remote > 0 || results.searched_remote_cached > 0) && (
               <button className="btn small" disabled={remoteBusy}
-                title="Scan the remote tables in scope on the SQL warehouse (one query per table – uses warehouse time)"
-                onClick={runRemoteValue}>{remoteBusy ? 'Searching Databricks…' : `⚡ Search ${results.skipped_remote + results.searched_remote_cached} remote tables live`}</button>
+                title="Scan the remote tables in scope live on their SQL engine (one query per table – uses remote compute time)"
+                onClick={runRemoteValue}>{remoteBusy ? 'Searching remote tables…' : `⚡ Search ${results.skipped_remote + results.searched_remote_cached} remote tables live`}</button>
             )}
           </div>
           {filter && (
@@ -196,14 +314,14 @@ export default function App() {
             </div>
           )}
           {error && <div className="error banner">{error}</div>}
-          {empty ? <Welcome db={stats.db} /> : (
+          {empty ? <Welcome db={stats.db} onAdd={() => setAdding({})} /> : (
             <main className={`explore ${hasCols ? 'three' : 'two'}`}>
-              <TablePane results={list} selected={selKey} mode={mode} browsing={!results}
+              <TablePane results={list} selected={selKey} mode={mode} browsing={!results} term={term} sort={tableSort} setSort={setTableSort}
                 checked={checked} setChecked={setChecked} canLookup={canLookup} onLookup={() => runLookup()} lookupHint={lookupHint}
                 lkRemote={lkRemote} setLkRemote={setLkRemote}
                 onSelect={(r) => openTable(r.schema, r.table, r.matched_columns?.[0]?.column || null)}
                 onProfile={(r) => openTable(r.schema, r.table, null, 'profile')} />
-              {hasCols && <ColumnPane results={results.tables} selectedTable={selKey} selectedColumn={selCol} mode={mode}
+              {hasCols && <ColumnPane results={results.tables} selectedTable={selKey} selectedColumn={selCol} mode={mode} term={term}
                 onSelect={(r, c) => openTable(r.schema, r.table, c.column)}
                 onProfile={(r, c) => { openTable(r.schema, r.table, c.column); setDrawer({ schema: r.schema, table: r.table, column: c.column }) }} />}
               {panel === 'lookup' && lk.filter ? (
@@ -212,10 +330,10 @@ export default function App() {
                   onClose={() => setPanel('detail')} onOpenTable={openTable} onOpenSql={(s) => { setSql(s); setView('sql') }} />
               ) : sel ? (
                 <TableDetail schema={sel.schema} table={sel.table} highlight={highlight} focusColumn={selCol} tab={tab} setTab={setTab}
-                  workshop={workshop} allTables={allTables} refreshKey={refreshKey} onPulled={loadMeta}
+                  workshop={workshop} allTables={allTables} refreshKey={refreshKey} onPulled={loadMeta} term={term}
                   onOpenColumn={(c) => { setSelCol(c); setDrawer({ schema: sel.schema, table: sel.table, column: c }) }}
                   onOpenTable={openTable} onOpenSql={(s) => { setSql(s); setView('sql') }} />
-              ) : <Hint />}
+              ) : <Hint tables={allTables} onOpenTable={openTable} />}
             </main>
           )}
         </>
@@ -224,46 +342,60 @@ export default function App() {
       {view === 'ann' && <AnnotationsView onOpenTable={openTable} refreshKey={refreshKey} scope={scopeParam} />}
       {view === 'sql' && <SqlView sql={sql} setSql={setSql} tables={allTables} />}
 
+      {adding && <AddData initialFiles={adding.files} schemas={stats?.schemas || []} onClose={() => setAdding(null)} onLoaded={onLoaded} onOpenTable={openTable} />}
+      {palette && <QuickOpen tables={allTables} scope={scopeParam} commands={commands} onOpenTable={openTable} onClose={() => setPalette(false)} />}
+      {help && <ShortcutHelp onClose={() => setHelp(false)} />}
+      {dragging && !adding && <div className="drop-overlay"><div>⤓ Drop to add data<div className="small muted">CSV · Parquet · JSON · Excel — files or folders</div></div></div>}
+      {toast && <div className="toast">{toast}</div>}
       {drawer && <ProfileDrawer target={drawer} onClose={() => setDrawer(null)} onValueSearch={valueSearch}
         onOpenTable={(s, t, c) => { setDrawer(null); openTable(s, t, c) }} onSaved={() => { setRefreshKey((k) => k + 1); loadMeta() }} />}
     </div>
   )
 }
 
-function Hint() {
+function Hint({ tables = [], onOpenTable }) {
+  const byKey = Object.fromEntries(tables.map((t) => [`${t.schema}.${t.table}`, t]))
+  const rec = recent.get().filter((k) => byKey[k]).slice(0, 8)
   return (
     <div className="detail hint">
+      {rec.length > 0 && (
+        <>
+          <h3>Recent tables</h3>
+          <div className="recent">
+            {rec.map((k) => <button key={k} className="btn mono" onClick={() => onOpenTable(byKey[k].schema, byKey[k].table)}><span className="muted">{byKey[k].schema}.</span>{byKey[k].table}</button>)}
+          </div>
+        </>
+      )}
       <h3>Pick a table, or search</h3>
       <ul>
         <li><b>Name search</b> is fuzzy across table names, column names, comments and your tags / CDM mappings. Wildcards work: <code>*_dt</code>, <code>res*</code>. Use <code>table.column</code> to narrow it down.</li>
         <li><b>Value search</b> finds which columns contain a value (e.g. a property code or confirmation number). It scans the data, so press Enter.</li>
         <li>Click a <b>column</b> to open its table's schema with the matches highlighted. The <b>▤</b> button opens a profile.</li>
         <li>In the schema, tick columns to <b>sample</b> just those or to <b>check whether they form a key</b>.</li>
-        <li>Press <kbd>/</kbd> to jump to search.</li>
+        <li><kbd>{MOD} K</kbd> jumps to any table or column · <kbd>↓</kbd><kbd>↑</kbd> move through the list · <kbd>/</kbd> search · <kbd>?</kbd> all shortcuts.</li>
+        <li>Drop CSV, Parquet, JSON or Excel files anywhere to <b>add data</b>.</li>
       </ul>
     </div>
   )
 }
 
-function Welcome({ db }) {
+function Welcome({ db, onAdd }) {
   return (
     <div className="detail hint welcome">
       <h3>No data loaded yet</h3>
       <p className="muted">Database: <code>{db}</code></p>
-      <p>Try it with the sample hotel dataset (PMS + CRM, fictional):</p>
+      <div className="welcome-drop" onClick={onAdd}>
+        <div className="dz-icon">⤓</div>
+        <b>Drop files or a folder here, or click to add data</b>
+        <div className="muted small">CSV · TSV · Parquet · JSON · Excel. A folder becomes a schema; the tables are profiled and related automatically.</div>
+      </div>
+      <p>Or try it with the sample hotel dataset (PMS + CRM, fictional):</p>
       <pre>{`uv run bearings demo
 uv run bearings serve --db data/demo.duckdb`}</pre>
-      <p>Or load your own Databricks exports:</p>
-      <pre>{`# 1. load exports (CSV or Parquet; a folder of part-files = one table)
-uv run bearings load ./exports --schema pms
-
-# 2. optional: column descriptions (export of information_schema.columns)
-uv run bearings comments ./exports/columns.csv
-
-# 3. profile + find relationships
-uv run bearings profile
-uv run bearings relate`}</pre>
-      <p className="muted">Then refresh this page.</p>
+      <p>From the command line:</p>
+      <pre>{`uv run bearings load ./exports/opera --schema pms     # CSV / Parquet / JSON / Excel
+uv run bearings comments ./exports/columns.csv         # optional descriptions
+uv run bearings profile && uv run bearings relate`}</pre>
     </div>
   )
 }

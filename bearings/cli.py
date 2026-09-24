@@ -36,20 +36,35 @@ def _rw(db: Path):
 
 
 @app.command()
-def load(path: Path = typer.Argument(..., exists=True, help="A .csv/.parquet file, or a folder of them. A sub-folder of parquet part-files becomes one table."),
+def load(path: Path = typer.Argument(..., exists=True, help="A file (.csv .tsv .parquet .json .jsonl .xlsx …) or a folder of them. "
+                                                           "A sub-folder of part-files becomes one table; an Excel workbook one table per sheet."),
          schema: str = typer.Option("main", "--schema", "-s", help="Target schema, e.g. the source system (pms, crm, finance)"),
          append: bool = typer.Option(False, "--append", help="Append to existing tables instead of replacing"),
-         all_varchar: bool = typer.Option(False, "--all-varchar", help="Load CSV columns as text (keeps leading zeros / raw formats)"),
+         all_varchar: bool = typer.Option(False, "--all-varchar", help="Load CSV / Excel columns as text (keeps leading zeros / raw formats)"),
          delim: Optional[str] = typer.Option(None, "--delim", help="CSV delimiter if auto-detect fails"),
+         sheet: Optional[List[str]] = typer.Option(None, "--sheet", help="Excel: only this sheet (repeatable). Default: every non-empty sheet"),
+         header_row: Optional[int] = typer.Option(None, "--header-row", help="Excel: row number of the header (default: first non-empty row)"),
+         dry_run: bool = typer.Option(False, "--dry-run", help="Only list the tables that would be loaded"),
          db: Optional[Path] = DbOpt):
-    """Load CSV / Parquet exports into DuckDB."""
+    """Load local exports (CSV / TSV, Parquet, JSON / NDJSON, Excel) into DuckDB."""
+    if dry_run:
+        from .loaders import LoadOptions
+        items = loader.discover(path, LoadOptions(sheets=list(sheet or []), header_row=header_row), echo=typer.echo)
+        for it in items:
+            typer.echo(f"  {schema}.{it.table:<40} {it.format:<8} ← {it.label}")
+        typer.echo(f"{len(items)} table(s) would be loaded.")
+        return
     dbp = _db(db)
     con = _rw(dbp)
     typer.echo(f"Loading {path} → {dbp} (schema {schema})")
     t0 = time.time()
-    res = loader.load(con, path, schema=schema, mode="append" if append else "replace", all_varchar=all_varchar, delim=delim, echo=typer.echo)
+    res = loader.load(con, path, schema=schema, mode="append" if append else "replace", all_varchar=all_varchar, delim=delim,
+                      sheets=sheet, header_row=header_row, echo=typer.echo)
     con.close()
-    typer.secho(f"Done: {len(res)} tables in {time.time() - t0:.1f}s. Next: bearings profile", fg="green")
+    ok = [r for r in res if "error" not in r]
+    failed = len(res) - len(ok)
+    typer.secho(f"Done: {len(ok)} tables in {time.time() - t0:.1f}s{f', {failed} failed' if failed else ''}. Next: bearings profile",
+                fg="yellow" if failed else "green")
 
 
 @app.command()
@@ -336,8 +351,8 @@ def serve(port: int = typer.Option(8765, "--port", "-p"), host: str = typer.Opti
     uvicorn.run("bearings.api:app", host=host, port=port, reload=reload, log_level="warning")
 
 
-# ============================================================== remote (Azure Databricks)
-remote_app = typer.Typer(no_args_is_help=True, help="Databricks connection profiles (~/.bearings/connections.toml, no secrets).")
+# ============================================================== remote sources (connectors: Azure Databricks, …)
+remote_app = typer.Typer(no_args_is_help=True, help="Remote connection profiles (~/.bearings/connections.toml, no secrets). Built-in type: databricks.")
 app.add_typer(remote_app, name="remote")
 
 
@@ -373,16 +388,41 @@ def _print_changes(res: dict, limit: int = 40):
         typer.echo(f"      … {len(ch) - limit} more (see the app, or GET /api/remote/changes)")
 
 
+def _settings(pairs: list[str] | None) -> dict:
+    out = {}
+    for p in pairs or []:
+        if "=" not in p:
+            typer.secho(f"--set needs key=value, got {p!r}", fg="red")
+            raise typer.Exit(1)
+        k, v = p.split("=", 1)
+        out[k.strip()] = v.strip()
+    return out
+
+
 @remote_app.command("add")
 def remote_add(name: str = typer.Argument(..., help="Profile name, e.g. dev"),
-               host: Optional[str] = typer.Option(None, "--host", help="Workspace URL, e.g. https://adb-123.12.azuredatabricks.net"),
-               warehouse: Optional[str] = typer.Option(None, "--warehouse", "-w", help="SQL warehouse id (needed for pull / remote queries)"),
-               profile: Optional[str] = typer.Option(None, "--profile", help="Reuse a Databricks CLI profile from ~/.databrickscfg instead"),
-               auth_type: Optional[str] = typer.Option(None, "--auth-type", help="Default external-browser (Entra ID sign-in)")):
+               type_: Optional[str] = typer.Option(None, "--type", help="Connector type (default: databricks, or the profile's current type)"),
+               host: Optional[str] = typer.Option(None, "--host", help="Databricks: workspace URL, e.g. https://adb-123.12.azuredatabricks.net"),
+               warehouse: Optional[str] = typer.Option(None, "--warehouse", "-w", help="Databricks: SQL warehouse id (needed for pull / remote queries)"),
+               profile: Optional[str] = typer.Option(None, "--profile", help="Databricks: reuse a Databricks CLI profile from ~/.databrickscfg instead"),
+               auth_type: Optional[str] = typer.Option(None, "--auth-type", help="Databricks: default external-browser (Entra ID sign-in)"),
+               set_: Optional[List[str]] = typer.Option(None, "--set", help="Any connector setting as key=value (repeatable)")):
     """Add or update a connection profile."""
     from .remote import connections as cx
-    c = _remote(cx.upsert, name, host=host, warehouse_id=warehouse, profile=profile, auth_type=auth_type)
-    typer.secho(f"Saved '{c.name}' in {cx.config_path()}. Next: bearings remote login {c.name}", fg="green")
+    fields = {"host": host, "warehouse_id": warehouse, "profile": profile, "auth_type": auth_type, **_settings(set_)}
+    c = _remote(cx.upsert, name, type=type_, **fields)
+    typer.secho(f"Saved '{c.name}' ({c.connector.label}) in {cx.config_path()}. Next: bearings remote login {c.name}", fg="green")
+
+
+@remote_app.command("types")
+def remote_types():
+    """List the connector types this installation knows."""
+    from .remote import connectors
+    for t, cls in connectors.types().items():
+        state = "installed" if cls.installed() else f"needs: uv sync --extra {cls.extra}"
+        typer.echo(f"  {t:<14} {cls.label:<14} {state}")
+        for f in cls.fields:
+            typer.echo(f"      {f.key:<16} {f.help}")
 
 
 @remote_app.command("list")
@@ -393,7 +433,10 @@ def remote_list():
     if not conns:
         typer.echo("No connections yet. Add one: bearings remote add <name> --host https://adb-….azuredatabricks.net --warehouse <id>")
     for c in conns.values():
-        typer.echo(f"  {c.name:<16} {c.host or 'profile ' + c.profile}   warehouse {c.warehouse_id or '—'}")
+        try:
+            typer.echo(f"  {c.name:<16} {c.type:<11} {c.connector.describe()}")
+        except Exception as e:  # an unknown type in the file shouldn't hide the others
+            typer.echo(f"  {c.name:<16} {c.type:<11} ({e})")
 
 
 @remote_app.command("remove")
@@ -403,19 +446,16 @@ def remote_remove(name: str):
     typer.echo("Removed." if cx.remove(name) else f"No connection called {name}")
 
 
-def _whoami(client) -> str:
-    me = client.current_user.me()
-    return me.user_name or me.display_name or "?"
-
-
 @remote_app.command("login")
 def remote_login(name: str):
-    """Sign in (opens the browser for Entra ID the first time; the SDK caches the token)."""
+    """Sign in (Databricks: opens the browser for Entra ID the first time; the SDK caches the token)."""
     from .remote import connections as cx
     c = _remote(cx.get, name)
-    typer.echo(f"Signing in to {c.host or c.profile} … (a browser window may open)")
+    typer.echo(f"Signing in to {c.connector.label} ({c.connector.describe()}) … (a browser window may open)")
     try:
-        who = _whoami(_remote(cx.workspace_client, c))
+        who = _remote(c.connector.whoami)
+    except typer.Exit:
+        raise
     except Exception as e:
         typer.secho(f"Sign-in failed: {str(e).splitlines()[0]}", fg="red")
         raise typer.Exit(1)
@@ -424,10 +464,10 @@ def remote_login(name: str):
 
 @remote_app.command("test")
 def remote_test(name: str, catalog: Optional[str] = typer.Option(None, "--catalog", help="Also list this catalog's schemas")):
-    """Check sign-in, Unity Catalog access and the SQL warehouse, step by step."""
+    """Check sign-in, catalog access and the SQL engine (Databricks: Unity Catalog + SQL warehouse), step by step."""
     from .remote import connections as cx
-    from .remote import sync as rsync
     c = _remote(cx.get, name)
+    k = c.connector
     ok = True
 
     def step(label, fn):
@@ -440,47 +480,39 @@ def remote_test(name: str, catalog: Optional[str] = typer.Option(None, "--catalo
             ok = False
             typer.secho(f"  ✗ {label}: {str(e).splitlines()[0] if str(e) else type(e).__name__}", fg="red")
 
-    client = _remote(cx.workspace_client, c)
-    step("sign-in", lambda: _whoami(client))
-    step("Unity Catalog", lambda: ", ".join(rsync.list_catalogs(client)[:10]) or "(no catalogs visible)")
+    step("sign-in", k.whoami)
+    step("catalogs", lambda: ", ".join(k.list_catalogs()[:10]) or "(no catalogs visible)")
     if catalog:
-        step(f"schemas in {catalog}", lambda: ", ".join(s["schema"] for s in rsync.list_schemas(client, catalog)[:15]))
-    if c.warehouse_id:
+        step(f"schemas in {catalog}", lambda: ", ".join(s["schema"] for s in k.list_schemas(catalog)[:15]))
+    if k.can_query():
         def q():
-            con = cx.sql_connect(c)
+            con = k.sql_connect()
             try:
                 cur = con.cursor()
                 cur.execute("SELECT 1")
-                return f"warehouse {c.warehouse_id} answered {cur.fetchone()[0]}"
+                return f"{k.compute_label} answered {cur.fetchone()[0]}"
             finally:
                 con.close()
-        step("SQL warehouse", q)
+        step(k.compute_label, q)
     else:
-        typer.echo(f"  – no SQL warehouse configured (only needed for pull). Find its id with: bearings remote warehouses {name}")
+        typer.echo(f"  – no {k.compute_label} configured (only needed for profiling, pull and live queries). "
+                   f"Find one with: bearings remote warehouses {name}")
     raise typer.Exit(0 if ok else 1)
 
 
 @remote_app.command("warehouses")
 def remote_warehouses(name: str):
-    """List the SQL warehouses you can see, with their ids (the id is what --warehouse needs)."""
+    """List the SQL warehouses (compute) you can see, with their ids (the id is what --warehouse needs)."""
     from .remote import connections as cx
     c = _remote(cx.get, name)
-    client = _remote(cx.workspace_client, c)
-    try:
-        whs = list(client.warehouses.list())
-    except Exception as e:
-        typer.secho(f"Could not list SQL warehouses: {str(e).splitlines()[0]}", fg="red")
-        raise typer.Exit(1)
+    whs = _remote(c.connector.list_compute)
     if not whs:
-        typer.echo("No SQL warehouses visible to you. Ask a workspace admin for CAN USE on one (serverless starts fastest).")
+        typer.echo(f"No {c.connector.compute_label} visible to you. Ask a workspace admin for CAN USE on one (serverless starts fastest).")
         raise typer.Exit()
-    def v(x):
-        return getattr(x, "value", x) or ""
     typer.echo(f"  {'id':<18} {'name':<34} {'state':<9} {'type':<10} size")
     for w in whs:
-        kind = "serverless" if w.enable_serverless_compute else v(w.warehouse_type).lower() or "classic"
-        mark = "  ← current" if w.id == c.warehouse_id else ""
-        typer.echo(f"  {w.id:<18} {(w.name or '')[:34]:<34} {v(w.state):<9} {kind:<10} {w.cluster_size or ''}{mark}")
+        mark = "  ← current" if w["id"] == c.get("warehouse_id") else ""
+        typer.echo(f"  {w['id']:<18} {w['name'][:34]:<34} {w['state']:<9} {w['kind']:<10} {w['size']}{mark}")
     typer.echo(f"\nUse one with:  bearings remote add {name} --warehouse <id>")
 
 
@@ -488,9 +520,8 @@ def remote_warehouses(name: str):
 def remote_schemas(name: str, catalog: str = typer.Option(..., "--catalog", "-c"), db: Optional[Path] = DbOpt):
     """List the schemas in a catalog (and which are attached)."""
     from .remote import connections as cx
-    from .remote import sync as rsync
     c = _remote(cx.get, name)
-    rows = _remote(rsync.list_schemas, _remote(cx.workspace_client, c), catalog)
+    rows = _remote(c.connector.list_schemas, catalog)
     dbp = _db(db)
     attached = {}
     if dbp.exists():
@@ -564,9 +595,9 @@ def connect_cmd(host: Optional[str] = typer.Option(None, "--host", help="Workspa
             (typer.prompt("  Name for this connection", default="databricks") if not yes else "databricks")
         c = _remote(cx.upsert, name, host=host)
     typer.echo(f"  Signing in to {c.host} … (a browser window may open)")
+    k = c.connector
     try:
-        client = _remote(cx.workspace_client, c)
-        typer.secho(f"  ✓ signed in as {_whoami(client)}", fg="green")
+        typer.secho(f"  ✓ signed in as {_remote(k.whoami)}", fg="green")
     except typer.Exit:
         raise
     except Exception as e:
@@ -578,15 +609,15 @@ def connect_cmd(host: Optional[str] = typer.Option(None, "--host", help="Workspa
     if warehouse:
         c = _remote(cx.upsert, name, warehouse_id=warehouse)
     elif not c.warehouse_id:
-        whs = list(client.warehouses.list())
+        whs = _remote(k.list_compute)
         if not whs:
             typer.secho("  No SQL warehouse visible to you – attach still works; ask an admin for CAN USE on one for live queries.", fg="yellow")
         else:
-            label = {f"{w.name} ({w.id})": w for w in whs}
-            notes = {k: ("serverless" if w.enable_serverless_compute else "classic") + f", {getattr(w.state, 'value', w.state)}" for k, w in label.items()}
-            default = next((k for k, w in label.items() if w.enable_serverless_compute), next(iter(label)))
+            label = {f"{w['name']} ({w['id']})": w for w in whs}
+            notes = {n: ("serverless" if w.get("serverless") else "classic") + f", {w['state']}" for n, w in label.items()}
+            default = next((n for n, w in label.items() if w.get("serverless")), next(iter(label)))
             pick = default if (yes or len(whs) == 1) else _choose(list(label), "Warehouse", default=default, notes=notes)[0]
-            c = _remote(cx.upsert, name, warehouse_id=label[pick].id)
+            c = _remote(cx.upsert, name, warehouse_id=label[pick]["id"])
             typer.echo(f"  using {pick}")
     else:
         typer.echo(f"  using warehouse {c.warehouse_id}")
@@ -594,13 +625,13 @@ def connect_cmd(host: Optional[str] = typer.Option(None, "--host", help="Workspa
     # 3. catalog + schemas
     typer.secho("3/5  What to attach", bold=True)
     if not catalog:
-        cats = _remote(rsync.list_catalogs, client)
+        cats = _remote(rsync.list_catalogs, k)
         if yes:
             typer.secho("  --catalog is required with --yes", fg="red")
             raise typer.Exit(1)
         catalog = _choose(cats, "Catalog")[0]
     if not schema:
-        avail = [x["schema"] for x in _remote(rsync.list_schemas, client, catalog)]
+        avail = [x["schema"] for x in _remote(rsync.list_schemas, k, catalog)]
         if yes:
             typer.secho("  --schema is required with --yes", fg="red")
             raise typer.Exit(1)

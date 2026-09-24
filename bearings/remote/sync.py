@@ -1,8 +1,8 @@
-"""Attach a Unity Catalog schema and keep its metadata in sync with DuckDB `_meta.remote_*`.
+"""Attach a remote schema and keep its metadata in sync with DuckDB `_meta.remote_*`.
 
-Metadata comes from the Unity Catalog REST API (`tables.list`), which doesn't need a running SQL
-warehouse: no cold start, no warehouse cost. Network calls happen *before* the DuckDB write lock is
-taken, so the web app stays usable while a sync runs.
+Metadata comes from the connector's catalog API (Databricks: the Unity Catalog REST API, which doesn't
+need a running SQL warehouse – no cold start, no warehouse cost). Network calls happen *before* the
+DuckDB write lock is taken, so the web app stays usable while a sync runs.
 """
 from __future__ import annotations
 
@@ -17,51 +17,18 @@ CHANGE_KINDS = ("table_added", "table_dropped", "table_restored", "column_added"
                 "type_changed", "comment_changed", "table_comment_changed")
 
 
-# ------------------------------------------------------------------ reading Unity Catalog
-def _enum(v):
-    return getattr(v, "value", v) if v is not None else None
+# ------------------------------------------------------------------ reading the remote catalog (via the connector)
+def fetch_schema(connector, catalog: str, schema: str) -> dict[str, dict]:
+    """{table_name: {table_type, comment, updated_at, row_count, size_bytes, columns: [...]}} (see Connector.fetch_schema)."""
+    return connector.fetch_schema(catalog, schema)
 
 
-def _ts(ms):
-    if ms in (None, ""):
-        return None
-    try:
-        return dt.datetime.fromtimestamp(int(ms) / 1000, tz=dt.timezone.utc).replace(tzinfo=None)
-    except (TypeError, ValueError):
-        return None
+def list_catalogs(connector) -> list[str]:
+    return connector.list_catalogs()
 
 
-def fetch_schema(client, catalog: str, schema: str) -> dict[str, dict]:
-    """{table_name: {table_type, comment, updated_at, row_count, size_bytes, columns: [...]}} from Unity Catalog."""
-    out: dict[str, dict] = {}
-    try:
-        tables = list(client.tables.list(catalog_name=catalog, schema_name=schema))
-    except Exception as e:  # SDK raises NotFound / PermissionDenied / auth errors
-        raise RemoteError(f"Could not list tables in {catalog}.{schema}: {str(e).splitlines()[0]}") from e
-    for t in tables:
-        props = t.properties or {}
-        cols = []
-        for i, c in enumerate(sorted(t.columns or [], key=lambda c: (c.position if c.position is not None else 1_000_000))):
-            cols.append({"column_name": c.name, "ordinal": (c.position + 1) if c.position is not None else i + 1,
-                         "data_type": (c.type_text or _enum(c.type_name) or "").upper(),
-                         "nullable": c.nullable, "comment": c.comment or None})
-        num = props.get("spark.sql.statistics.numRows")
-        out[t.name] = {"table_type": _enum(t.table_type), "comment": t.comment or None,
-                       "updated_at": _ts(t.updated_at), "row_count": int(num) if str(num or "").isdigit() else None,
-                       "size_bytes": None, "columns": cols}
-    return out
-
-
-def list_catalogs(client) -> list[str]:
-    return sorted(c.name for c in client.catalogs.list())
-
-
-def list_schemas(client, catalog: str) -> list[dict]:
-    try:
-        return [{"schema": s.name, "comment": s.comment} for s in client.schemas.list(catalog_name=catalog)
-                if s.name != "information_schema"]
-    except Exception as e:
-        raise RemoteError(f"Could not list schemas in catalog {catalog}: {str(e).splitlines()[0]}") from e
+def list_schemas(connector, catalog: str) -> list[dict]:
+    return connector.list_schemas(catalog)
 
 
 # ------------------------------------------------------------------ local state
@@ -180,7 +147,7 @@ def sync(db_path: Path, alias: str, dry_run: bool = False, echo=lambda *_: None)
         old = stored_state(con, alias)
     conn = cx.get(src["connection"])
     echo(f"  reading {src['catalog']}.{src['schema']} from {conn.name}…")
-    new = fetch_schema(cx.workspace_client(conn), src["catalog"], src["schema"])
+    new = fetch_schema(conn.connector, src["catalog"], src["schema"])
     changes = diff(old, new)
     now = dt.datetime.now().replace(microsecond=0)
     if not dry_run:
@@ -219,7 +186,7 @@ def attach(db_path: Path, connection: str, catalog: str, schema: str, alias: str
             if alias in {s for s, _ in user_tables(con)}:
                 raise RemoteError(f"A local schema called '{alias}' already exists – pick another alias with --as")
     # fail before writing anything if the schema can't be read
-    fetch_schema(cx.workspace_client(conn), catalog, schema)
+    fetch_schema(conn.connector, catalog, schema)
     con = connect(db_path, read_only=False, retries=5)
     try:
         con.execute(f"INSERT INTO {META}.remote_sources (alias, connection, catalog, schema, attached_at) VALUES (?,?,?,?,?)",
@@ -251,9 +218,15 @@ def recent_changes(con, alias: str | None = None, limit: int = 200) -> list[dict
     return [dict(zip(cols, r)) for r in con.execute(sql, params).fetchall()]
 
 
+def dialect(src: dict):
+    """SQL dialect of an attached source's connection."""
+    from .connectors import dialect_for
+    return dialect_for(src.get("connection"))
+
+
 def remote_fq(src: dict, table: str) -> str:
-    """Fully qualified, back-quoted Databricks name."""
-    return ".".join("`" + x.replace("`", "``") + "`" for x in (src["catalog"], src["schema"], table))
+    """Fully qualified, quoted remote name (e.g. `catalog`.`schema`.`table` on Databricks)."""
+    return dialect(src).table_ref(src["catalog"], src["schema"], table)
 
 
 __all__ = ["attach", "sync", "detach", "diff", "fetch_schema", "list_schemas", "list_catalogs", "recent_changes",

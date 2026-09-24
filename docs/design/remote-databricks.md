@@ -2,6 +2,8 @@
 
 Status: **Phases 1–3 implemented** (metadata sync, re-sync, orphaned annotations, pull; remote profiling, key fingerprints, relationships and value search on remote tables; live sample / key check / lookup / value search / SQL console on the warehouse) · Branch: `feature/databricks-remote` · 2026-09-19
 
+> **v0.3 (2026-09-24):** everything Databricks-specific now sits behind the connector interface in `bearings/remote/connectors/` (`DatabricksConnector` + `DatabricksDialect`); the rest of remote mode is platform-neutral. See [connectors.md](connectors.md). The generated Databricks SQL is unchanged.
+
 ## 1. Goal
 
 Keep every local feature exactly as it is, and add Azure Databricks as a second kind of **source**. A remote schema behaves like a local one in the app. Its **metadata and profiles are cached in DuckDB**, so name search, profiles, annotations, exports and name-based relationships work offline. Only the actions that need **rows** go to Databricks.

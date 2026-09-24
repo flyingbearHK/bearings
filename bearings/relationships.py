@@ -80,8 +80,9 @@ def _compatible(t1: str, t2: str) -> bool:
 
 
 def discover(con, min_overlap: float = 0.5, name_threshold: float = 0.75, deep: bool = False,
-             max_pairs: int = 5000, echo=print, schemas: set[str] | None = None) -> list[dict]:
-    """schemas: only consider tables in these schemas (both ends of a relationship)."""
+             max_pairs: int = 5000, echo=print, schemas: set[str] | None = None, touching: set[str] | None = None) -> list[dict]:
+    """schemas: only consider tables in these schemas (both ends of a relationship).
+    touching: only pairs with at least one end in these schemas (e.g. a schema that was just loaded)."""
     prof = con.execute(f"""SELECT schema_name, table_name, column_name, data_type, row_count, null_count, distinct_count, flags
                            FROM {META}.column_profile""").fetchall()
     if schemas:
@@ -99,6 +100,8 @@ def discover(con, min_overlap: float = 0.5, name_threshold: float = 0.75, deep: 
             continue
         for t in targets:
             if (f["s"], f["t"]) == (t["s"], t["t"]):
+                continue
+            if touching and f["s"] not in touching and t["s"] not in touching:
                 continue
             if not _compatible(f["type"], t["type"]) or f["dist"] > t["dist"] * 1.02:
                 continue
@@ -150,10 +153,13 @@ def discover(con, min_overlap: float = 0.5, name_threshold: float = 0.75, deep: 
     return out
 
 
-def save(con, rels: list[dict], schemas: set[str] | None = None):
-    """Replace discovered relationships (only those inside `schemas` when given)."""
+def save(con, rels: list[dict], schemas: set[str] | None = None, touching: set[str] | None = None):
+    """Replace discovered relationships (only those inside `schemas`, or with an end in `touching`, when given)."""
     now = datetime.now()
-    if schemas:
+    if touching:
+        ph = ", ".join("?" for _ in touching)
+        con.execute(f"DELETE FROM {META}.relationships WHERE from_schema IN ({ph}) OR to_schema IN ({ph})", [*touching, *touching])
+    elif schemas:
         ph = ", ".join("?" for _ in schemas)
         con.execute(f"DELETE FROM {META}.relationships WHERE from_schema IN ({ph}) AND to_schema IN ({ph})", [*schemas, *schemas])
     else:

@@ -4,7 +4,7 @@ import SyncResult from './SyncResult.jsx'
 import { useRemoteJob } from './RemoteProfile.jsx'
 
 /** Header control: restrict the whole app (search, lists, lookups, relationships, annotations, exports) to schemas.
- *  Local schemas and attached Databricks schemas (grouped by connection → catalog) can be mixed; remote ones can be re-synced here. */
+ *  Local schemas and attached remote schemas (grouped by connection → catalog) can be mixed; remote ones can be re-synced here. */
 export default function ScopePicker({ schemas, scope, setScope, onSynced }) {
   const [open, setOpen] = useState(false)
   const [job, setJob] = useState(null)
@@ -36,7 +36,7 @@ export default function ScopePicker({ schemas, scope, setScope, onSynced }) {
   const local = schemas.filter((s) => s.kind !== 'remote')
   const remote = schemas.filter((s) => s.kind === 'remote')
   const groups = {}
-  for (const s of remote) (groups[`${s.connection} · ${s.catalog}`] ||= { connection: s.connection, catalog: s.catalog, items: [] }).items.push(s)
+  for (const s of remote) (groups[`${s.connection} · ${s.catalog}`] ||= { connection: s.connection, catalog: s.catalog, platform: s.platform, items: [] }).items.push(s)
   const running = job?.status === 'running'
   const sync = (body) => { setErr(null); api.remoteSync(body).then(setJob).catch((e) => setErr(e.message)) }
 
@@ -52,12 +52,12 @@ export default function ScopePicker({ schemas, scope, setScope, onSynced }) {
       </label>
       <span className="row-actions">
         {s.kind === 'remote' && (
-          <button className="icon-btn small" disabled={running} title={`Re-sync metadata of ${s.catalog}.${s.remote_schema} from Databricks`}
+          <button className="icon-btn small" disabled={running} title={`Re-sync metadata of ${s.catalog}.${s.remote_schema} from ${s.platform || 'the remote source'}`}
             onClick={() => sync({ aliases: [s.schema] })}>↻</button>
         )}
         {s.kind === 'remote' && (
           <button className="icon-btn small" disabled={pj.running}
-            title="Profile tables not profiled yet, or changed since, on the SQL warehouse (uses warehouse time)"
+            title={`Profile tables not profiled yet, or changed since, on the ${s.compute_label || 'remote engine'} (uses its compute time)`}
             onClick={() => pj.start({ aliases: [s.schema], only_stale: true })}>⚡</button>
         )}
         <button className="link small" onClick={() => { setScope([s.schema]); setOpen(false) }}>only</button>
@@ -82,7 +82,7 @@ export default function ScopePicker({ schemas, scope, setScope, onSynced }) {
             {Object.entries(groups).map(([k, g]) => (
               <React.Fragment key={k}>
                 <li className="group-head">
-                  <span><span className="cloud" title="Azure Databricks – metadata synced locally">☁</span> {g.connection} <span className="muted">· {g.catalog}</span></span>
+                  <span><span className="cloud" title={`${g.platform || 'Remote'} – metadata synced locally`}>☁</span> {g.connection} <span className="muted">· {g.catalog}</span></span>
                   <button className="link small" disabled={running} title={`Re-sync every attached schema from catalog ${g.catalog}`}
                     onClick={() => sync({ connection: g.connection, catalog: g.catalog })}>↻ sync all</button>
                 </li>
@@ -95,7 +95,7 @@ export default function ScopePicker({ schemas, scope, setScope, onSynced }) {
           {(pj.job || pj.err) && (
             <div className="sync-result">
               <div className="sync-head">
-                <b>{pj.running ? `Profiling on Databricks… ${pj.job.done || 0}/${pj.job.total}` : pj.job?.status === 'failed' ? 'Profiling failed' : pj.job ? `Profiled ${pj.job.results.length}/${pj.job.total} tables` : ''}</b>
+                <b>{pj.running ? `Profiling remotely… ${pj.job.done || 0}/${pj.job.total}` : pj.job?.status === 'failed' ? 'Profiling failed' : pj.job ? `Profiled ${pj.job.results.length}/${pj.job.total} tables` : ''}</b>
                 {!pj.running && <button className="link small" onClick={pj.clear}>close</button>}
               </div>
               {pj.running && pj.job.current && <div className="muted small mono">{pj.job.current}</div>}

@@ -1,6 +1,6 @@
 <h1 align="center">🐻 Bearings</h1>
 <p align="center"><b>Get your bearings in unfamiliar source data.</b><br>
-A local data-modelling workbench: load CSV/Parquet exports into DuckDB, then search, profile, sample and relate them from a fast web UI.</p>
+A local data-modelling workbench: load CSV, Parquet, JSON or Excel exports into DuckDB (or attach Azure Databricks), then search, profile, sample and relate them from a fast web UI.</p>
 <p align="center">
   <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
   <img alt="Python 3.10+" src="https://img.shields.io/badge/python-3.10%2B-blue">
@@ -12,6 +12,7 @@ A local data-modelling workbench: load CSV/Parquet exports into DuckDB, then sea
 
 When you're dropped into a new data-modelling engagement, the first weeks go into "where is the guest ID?", "which of these 400 columns are always empty?" and "how do these two systems join?". Bearings answers those questions in seconds, **entirely on your machine**, so client data never leaves your laptop.
 
+- **Add data without typing:** drop files or a whole folder onto the app (CSV, TSV, Parquet, JSON, Excel), or pick a folder on your machine. Bearings previews the tables it found, then loads, profiles and relates them in the background.
 - **Search everything:** fuzzy, contains or exact search over table and column names, comments, tags and CDM mappings. Search *values* too: "which columns contain `G00000042`?"
 - **Two-layer results:** tables on the left, matched columns next to them, and the full schema with the matches highlighted.
 - **Profile at a glance:** null % and distinct counts, top values, value patterns, histograms, and flags for candidate keys, PII, mixed formats and constant columns.
@@ -20,13 +21,14 @@ When you're dropped into a new data-modelling engagement, the first weeks go int
 - **Annotate and export:** tag columns (PII, key…), map them to CDM entities and attributes, and export an Excel mapping workbook, JSON or Markdown specs.
 - **Schema scope:** load each source system into its own schema and focus the whole app on one or several of them.
 - **Workshop mode:** bigger text, and PII masked in samples, for screen-sharing with a room full of stakeholders.
+- **Keyboard-first:** <kbd>⌘/Ctrl K</kbd> jumps to any table or column, <kbd>↑</kbd><kbd>↓</kbd> walk the result list, <kbd>1</kbd>–<kbd>4</kbd> switch views, and every grid has a quick filter, remembered sort, *hide empty columns* and double-click-to-copy.
 
 | Look up a key across tables | Column profile | Discovered relationships |
 |---|---|---|
 | ![lookup](docs/screenshots/lookup.png) | ![profile](docs/screenshots/profile.png) | ![relationships](docs/screenshots/relationships.png) |
 
 ```
-exports (csv/parquet) ──bearings load──▶ data/bearings.duckdb ──bearings profile / relate──▶ _meta.* ──bearings serve──▶ http://127.0.0.1:8765
+exports (csv/parquet/json/xlsx) ──bearings load / drop in the app──▶ data/bearings.duckdb ──bearings profile / relate──▶ _meta.* ──bearings serve──▶ http://127.0.0.1:8765
                                                         annotations → data/bearings.annotations.sqlite (kept when you rebuild the DB)
 ```
 
@@ -100,9 +102,11 @@ Start over at any time with `uv run bearings demo`, which rebuilds `data/demo.du
 ## Workflow
 
 ```bash
-# 1. Load. A file becomes one table; a folder of Spark part-files becomes one table named after the folder.
+# 1. Load. A file becomes one table; a folder of Spark part-files becomes one table named after the folder;
+#    every non-empty sheet of an Excel workbook becomes a table. (Or drop the files onto the app: ＋ Add data.)
 uv run bearings load ./exports/opera --schema pms          # --append to add files, --all-varchar to keep raw text (leading zeros)
 uv run bearings load ./exports/crm   --schema crm
+uv run bearings load ./reference/hotel_master.xlsx -s ref  # --sheet Properties (repeatable), --header-row 3, --dry-run to preview
 
 # 2. Optional: descriptions from Databricks (they become searchable)
 uv run bearings comments ./exports/columns.csv             # needs table_name, column_name, comment [, table_schema]
@@ -128,6 +132,26 @@ uv run bearings reset                                      # start fresh – see
 The server holds the database lock only for the length of each request, so you can run `bearings load`, `bearings profile` or `bearings relate` while `bearings serve` is running (in another terminal). Refresh the browser afterwards. A GUI client such as DBeaver that keeps the file open will block writes.
 
 Use `--db path/to/other.duckdb` or `export BEARINGS_DB=...` to keep a separate database per engagement or domain.
+
+### Supported files
+
+| Format | Extensions | How it maps to tables |
+|---|---|---|
+| CSV / TSV | `.csv` `.tsv` `.txt` (+ `.gz`) | One table per file. Types are inferred from all rows; `--all-varchar` keeps everything as text. |
+| Parquet | `.parquet` `.pq` | One table per file. |
+| JSON | `.json` `.jsonl` `.ndjson` (+ `.gz`) | Arrays, objects or newline-delimited JSON; one table per file. |
+| Excel | `.xlsx` `.xlsm` | **One table per non-empty sheet**: `<file>_<sheet>`, or just `<file>` when there is one sheet. Types come from the cell types Excel stored, so a text column keeps leading zeros (`00123`), whole numbers become BIGINT and dates DATE/TIMESTAMP; a column mixing types becomes text. Formulas load as their last calculated value. The header is the first non-empty row (`--header-row N` to override). Legacy `.xls`: save as `.xlsx` first. |
+
+A sub-folder of **part-files** (Spark / Databricks `part-00000-….parquet`, hive partitions `year=2026/…`, or numbered chunks `guest_001.csv`) becomes one table named after the sub-folder. Any other sub-folder is loaded file by file. Readers live in `bearings/loaders/`; adding a format is one small class (see `FileReader`).
+
+### Adding data from the app
+
+Click **＋ Add data** (or press <kbd>a</kbd>, or simply drop files anywhere on the page):
+
+- **Drop files or a folder**: they're copied into `data/uploads/` and previewed. A dropped folder's name becomes the suggested schema.
+- **Or a path on this computer**: type or paste it, or **Browse…** to click through folders. Nothing is copied. For your safety this only works in a browser on the machine running Bearings.
+- The **preview** lists every table it found (tick the ones you want), flags tables that already exist, offers *Replace* or *Append*, Excel sheet / header-row options and *all as text*. It also recognises **description files** (CSV with `table_name, column_name, comment`) and imports them as searchable comments.
+- **Load** runs in the background: load → descriptions → profile → relationships touching the new schema. The app refreshes when it's done, and one click opens the first table.
 
 ### Several source systems: schemas and the schema scope
 
@@ -197,6 +221,8 @@ uv run bearings load ./exports/opera --schema pms && uv run bearings profile -s 
 The manual way: stop the server and delete the files. `rm data/bearings.duckdb data/bearings.duckdb.wal` wipes the data; also delete `data/bearings.annotations.sqlite` to lose the annotations. `rm -rf demo/ data/demo.*` removes the demo.
 
 ### Remote mode: connect to Azure Databricks (preview)
+
+Remote platforms plug in as **connectors** (`bearings/remote/connectors/`). Databricks is the one built in; a connection profile's `type` (default `databricks`) picks the connector, and `bearings remote types` lists what's available. Everything below (attach, sync, profile, pull, cache, live queries, the SQL console) goes through the connector interface, so a new platform only has to implement it – see [docs/design/connectors.md](docs/design/connectors.md).
 
 Instead of exporting files, you can attach a Unity Catalog schema directly. Bearings syncs its **metadata** (tables, columns, types, comments) into the local database, so name search, annotations, CDM mappings and exports work on it straight away, even offline. The **rows stay in Databricks** until you copy a sample with `bearings pull`.
 
@@ -289,6 +315,12 @@ SELECT table_schema, table_name, '' AS column_name, comment FROM cat.information
 | **SQL** | A read-only DuckDB console. Try `SUMMARIZE pms.guest`. Ctrl/⌘+Enter runs the query. |
 | **Schema scope** | The **Schema** dropdown in the header limits the whole app to one or more source systems. See "Several source systems" above. |
 | **Workshop mode** | Larger text, and PII-flagged or PII-tagged columns are masked in samples. |
+| **Add data** | **＋ Add data**, <kbd>a</kbd>, or drop files anywhere. See "Adding data from the app" above. |
+| **Jump to** | <kbd>⌘/Ctrl K</kbd>: type part of a table or column name and press Enter. With an empty box it lists your recent tables and actions (go to SQL, workshop mode, export, clear scope…). |
+| **Grids** | Every grid: click a header to sort (remembered per grid), **Filter rows…** to narrow and highlight, **hide N empty columns** in samples / lookups / SQL results, double-click a cell to copy it. The schema grid can put **matched columns first**, **hide all-null columns**, and **copy names** of all columns. The table list can be sorted by best match, name, rows, columns or schema. |
+| **Highlights** | The search term is marked inside table and column names, comments and sample / lookup cells. |
+
+Keyboard: <kbd>⌘/Ctrl K</kbd> jump · <kbd>/</kbd> search · <kbd>↓</kbd>/<kbd>↑</kbd> next/previous table (works from the search box) · <kbd>⇧↓</kbd>/<kbd>⇧↑</kbd> next/previous matched column · <kbd>x</kbd> tick the table for **Show rows** · <kbd>1</kbd>–<kbd>4</kbd> Schema / Sample / Profile / Relationships · <kbd>s</kbd> sample · <kbd>a</kbd> add data · <kbd>Esc</kbd> clear · <kbd>?</kbd> all shortcuts.
 
 Profile flags: `PK?` (unique and not null), `unique*` (unique but has nulls), `≥50% null`, `all null`, `constant`, `mixed fmt`, `blanks`, `PII email/phone`, `PII?` (the column name suggests personal data).
 
@@ -305,7 +337,9 @@ npm run build      # rebuilds bearings/static/
 ```
 bearings/
   cli.py            `bearings` commands (typer)
-  loader.py         CSV/Parquet → DuckDB, comments import
+  loader.py         discover + load files → DuckDB, comments import
+  loaders/          file readers: CSV/TSV, Parquet, JSON, Excel (FileReader interface + registry)
+  ingest.py         load → describe → profile → relate in one step (the app's Add data)
   profiler.py       standard column profile
   relationships.py  FK discovery
   catalog.py        catalog cache, name search (exact/contains/fuzzy), value search
@@ -313,17 +347,19 @@ bearings/
   demo.py           fictional demo dataset generator
   db.py             connections, _meta schema, reset/drop/compact
   orphans.py        annotations whose column/table vanished + remap
-  remote/           Databricks: connection profiles, Unity Catalog sync, pull
+  remote/           remote sources: connection profiles, metadata sync, live queries, profile, pull/cache, PII masking
+  remote/connectors/  connector + SQL dialect interface; databricks.py (Unity Catalog + SQL warehouse)
   api.py            FastAPI (+ serves the built UI)
   static/           built UI
 web/                React + Vite source
-tests/              end-to-end smoke test on demo data; remote mode against a fake Databricks
+tests/              end-to-end smoke test on demo data; loaders (Excel…); Add data API; remote mode against a fake
+                    Databricks, and a second fake connector (plain SQL) to prove the connector interface
 docs/screenshots/   README images (demo data)
 ```
 
 ## Privacy
 
-Bearings is local-first. The server binds to `127.0.0.1` and everything it stores lives in `data/`, which `.gitignore` excludes together with CSV/Parquet/Excel files. It makes no outbound calls unless you set up remote mode, which is opt-in (`uv sync --extra databricks`, then `bearings remote add`) and only talks to the Databricks workspace you configure. The demo dataset is entirely fictional.
+Bearings is local-first. The server binds to `127.0.0.1` and everything it stores lives in `data/` (files dropped onto the app go to `data/uploads/`), which `.gitignore` excludes together with CSV/Parquet/Excel files. It makes no outbound calls unless you set up remote mode, which is opt-in (`uv sync --extra databricks`, then `bearings remote add`) and only talks to the Databricks workspace you configure. The demo dataset is entirely fictional.
 
 ## Contributing
 

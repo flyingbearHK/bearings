@@ -100,7 +100,7 @@ BUSINESS_TABLE = re.compile(r"^([a-z]\d_?|dim_?|ref_?)?(propert(y|ies)|organi[sz
 def _reason(col: str, dtype: str, flags: list[str], tags: str, table: str = "") -> str | None:
     """Why this column is masked (None = not masked). Tags always win; then business tables/columns are left
     alone; then content (values that look like e-mail / phone) and names of personal values."""
-    from .profile import spark_family
+    from .connectors import type_family
     if re.search(r"\bno[-_ ]?pii\b", tags, re.I):
         return None
     if re.search(r"\bpii\b", tags, re.I):
@@ -113,7 +113,7 @@ def _reason(col: str, dtype: str, flags: list[str], tags: str, table: str = "") 
         return "values look like e-mail addresses"
     if "pii_phone" in flags:
         return "values look like phone numbers"
-    fam = spark_family(dtype or "")
+    fam = type_family(dtype or "")
     base = re.sub(r"\d+$", "", re.sub(r"[^a-z0-9_]", "", col.lower()))
     flat = base.replace("_", "")
     if IDENTIFIER.search(base) and fam == "string":
