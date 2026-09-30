@@ -140,7 +140,7 @@ export default function InsightsPanel({ t, workshop, onOpenSql, onOpenColumn, on
               {keyRes && (
                 <div className={`notice ${keyRes.is_unique ? 'good' : keyRes.error ? 'bad' : ''}`}>
                   {keyRes.loading ? 'Checking…' : keyRes.error ? keyRes.error
-                    : <><b>{keyRes.cols.join(' + ')}</b>: {keyRes.is_unique ? 'unique on the whole table ✓' : `${fmt.n(keyRes.rows - keyRes.distinct)} duplicate rows`}
+                    : <><b>{keyRes.cols.join(' + ')}</b>: {keyRes.is_unique ? 'unique on the whole table ✓' : `${fmt.n(keyRes.rows - (keyRes.rows_with_nulls || 0) - keyRes.distinct)} duplicate rows`}
                       {keyRes.rows_with_nulls > 0 && <> · {fmt.n(keyRes.rows_with_nulls)} rows with nulls</>}</>}
                   <button className="icon-btn small" onClick={() => setKeyRes(null)}>✕</button>
                 </div>

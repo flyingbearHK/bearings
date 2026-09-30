@@ -299,10 +299,12 @@ def uniqueness(schema: str, table: str, body: dict = Body(...)):
                          **_source(tb, True)})
     with ro(DB) as con:
         key = ", ".join(qi(c) for c in cols)
+        anynull = " OR ".join(f"{qi(c)} IS NULL" for c in cols)
         rows, distinct, nulls = con.execute(
-            f"""SELECT count(*), (SELECT count(*) FROM (SELECT DISTINCT {key} FROM {fq(schema, table)})),
-                       count(*) FILTER (WHERE {' OR '.join(f'{qi(c)} IS NULL' for c in cols)}) FROM {fq(schema, table)}""").fetchone()
-        dups = con.execute(f"""SELECT {key}, count(*) n FROM {fq(schema, table)} GROUP BY ALL HAVING count(*) > 1 ORDER BY n DESC LIMIT 10""").fetchall()
+            f"""SELECT count(*), (SELECT count(*) FROM (SELECT DISTINCT {key} FROM {fq(schema, table)} WHERE NOT ({anynull}))),
+                       count(*) FILTER (WHERE {anynull}) FROM {fq(schema, table)}""").fetchone()
+        dups = con.execute(f"""SELECT {key}, count(*) n FROM {fq(schema, table)} WHERE NOT ({anynull})
+                               GROUP BY ALL HAVING count(*) > 1 ORDER BY n DESC LIMIT 10""").fetchall()
     return jsonable({"columns": cols, "rows": rows, "distinct": distinct, "rows_with_nulls": nulls,
                      "is_unique": rows == distinct and nulls == 0, "duplicate_examples": [list(d) for d in dups], **_source(tb, False)})
 

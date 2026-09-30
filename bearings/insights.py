@@ -106,7 +106,9 @@ def find_grain(con, src: str, n: int, cols: list[dict], full_src: str | None = N
             if prod < n:
                 continue
             tested += 1
-            d = con.execute(f"SELECT count(*) FROM (SELECT DISTINCT {', '.join(qi(x) for x in names)} FROM {src})").fetchone()[0]
+            notnull = " AND ".join(f"{qi(x)} IS NOT NULL" for x in names)
+            d = con.execute(f"SELECT count(*) FROM (SELECT DISTINCT {', '.join(qi(x) for x in names)} FROM {src} "
+                            f"WHERE {notnull})").fetchone()[0]
             if d >= n:
                 found.append(names)
             elif d / n > best[0]:
@@ -121,8 +123,10 @@ def find_grain(con, src: str, n: int, cols: list[dict], full_src: str | None = N
     if found and full_src and full_src != src:  # found on a sample: confirm on the whole table, keep what holds
         checked = []
         for combo in found:
-            tot, d = con.execute(f"SELECT count(*), (SELECT count(*) FROM (SELECT DISTINCT {', '.join(qi(x) for x in combo)} "
-                                 f"FROM {full_src})) FROM {full_src}").fetchone()
+            notnull = " AND ".join(f"{qi(x)} IS NOT NULL" for x in combo)
+            tot, d = con.execute(f"SELECT count(*) FILTER (WHERE {notnull}), "
+                                 f"(SELECT count(*) FROM (SELECT DISTINCT {', '.join(qi(x) for x in combo)} FROM {full_src} "
+                                 f"WHERE {notnull})) FROM {full_src}").fetchone()
             checked.append((tot - d, combo))
         ok = [c for dups, c in checked if dups == 0]
         if ok:

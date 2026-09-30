@@ -210,7 +210,7 @@ export default function TableDetail({ schema, table, highlight, focusColumn, tab
             <div className={`notice ${uniq.is_unique ? 'good' : uniq.error ? 'bad' : ''}`}>
               {uniq.loading ? 'Checking…' : uniq.error ? uniq.error : (
                 <>
-                  <b>{uniq.columns.join(' + ')}</b>: {uniq.is_unique ? 'unique — valid key ✓' : `not unique — ${fmt.n(uniq.rows - uniq.distinct)} duplicate rows`}
+                  <b>{uniq.columns.join(' + ')}</b>: {uniq.is_unique ? 'unique — valid key ✓' : `not unique — ${fmt.n(uniq.rows - (uniq.rows_with_nulls || 0) - uniq.distinct)} duplicate rows`}
                   {uniq.rows_with_nulls > 0 && <> · {fmt.n(uniq.rows_with_nulls)} rows with nulls</>}
                   {uniq.source && uniq.source !== 'local' && <span className="muted small"> · {sourceNote(uniq)}</span>}
                   {uniq.source === 'sample' && uniq.is_unique && <div className="small">Unique in the sample only – tick <b>⚡ Remote</b> and check again to be sure for the whole table.</div>}

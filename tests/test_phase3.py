@@ -156,6 +156,28 @@ def test_api(demo_db, con):
     assert {"Code lists", "DQ rules"} <= set(names)
 
 
+def test_uniqueness_with_nulls(tmp_path, monkeypatch):
+    """Check key: NULLs are rows with nulls, never a distinct value or a duplicate example."""
+    from bearings.db import connect
+    db = tmp_path / "t.duckdb"
+    c0 = connect(db)
+    c0.execute("CREATE TABLE k AS SELECT * FROM (VALUES ('a'),('a'),('b'),(NULL),(NULL)) v(x)")
+    c0.close()
+    monkeypatch.setenv("BEARINGS_DB", str(db))
+    import bearings.api as api
+    importlib.reload(api)
+    from bearings import catalog
+    catalog._cache["key"] = None
+    from fastapi.testclient import TestClient
+    c = TestClient(api.app)
+    u = c.post("/api/table/main/k/uniqueness", json={"columns": ["x"]}).json()
+    assert u["rows"] == 5 and u["distinct"] == 2 and u["rows_with_nulls"] == 2
+    assert not u["is_unique"]
+    assert u["duplicate_examples"] == [["a", 2]]                       # no NULL group in the examples
+    u = c.post("/api/table/main/k/uniqueness", json={"columns": ["x", "x"]}).json()
+    assert u["rows_with_nulls"] == 2 and u["distinct"] == 2
+
+
 def test_cli(demo_db, tmp_path):
     from bearings.cli import app
     out = tmp_path / "rules.zip"

@@ -235,10 +235,10 @@ def uniqueness(src: dict, table: str, cols: list[str]) -> dict:
     d = dialect_for(src["connection"])
     frm, key = remote_fq(src, table), ", ".join(d.quote(c) for c in cols)
     anynull = " OR ".join(f"{d.quote(c)} IS NULL" for c in cols)
-    r = run(src["connection"], f"""SELECT count(*) AS n_rows, (SELECT count(*) FROM (SELECT DISTINCT {key} FROM {frm})) AS n_distinct,
+    r = run(src["connection"], f"""SELECT count(*) AS n_rows, (SELECT count(*) FROM (SELECT DISTINCT {key} FROM {frm} WHERE NOT ({anynull}))) AS n_distinct,
                                           {d.count_if(anynull)} AS n_nulls FROM {frm}""", limit=1, cache=True)
     rows, distinct, nulls = r["rows"][0]
-    d = run(src["connection"], f"SELECT {key}, count(*) AS n FROM {frm} GROUP BY {key} HAVING count(*) > 1 ORDER BY n DESC LIMIT 10",
+    d = run(src["connection"], f"SELECT {key}, count(*) AS n FROM {frm} WHERE NOT ({anynull}) GROUP BY {key} HAVING count(*) > 1 ORDER BY n DESC LIMIT 10",
             limit=10, cache=True)
     return {"rows": rows, "distinct": distinct, "rows_with_nulls": nulls, "duplicate_examples": d["rows"],
             "elapsed_ms": r["elapsed_ms"] + d["elapsed_ms"]}
