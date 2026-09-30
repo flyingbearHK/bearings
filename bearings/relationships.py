@@ -239,6 +239,8 @@ def save(con, rels: list[dict], schemas: set[str] | None = None, touching: set[s
             "name_score", "overlap_pct", "from_distinct", "matched_distinct", "confidence", "method"]
     if has_meta_column(con, "relationships", "cardinality"):
         keys += CARD_KEYS
+    if not rels:  # DuckDB's executemany rejects an empty parameter list
+        return
     con.executemany(f"INSERT INTO {META}.relationships ({', '.join(keys)}, found_at) VALUES ({', '.join('?' * (len(keys) + 1))})",
                     [[r.get(k) for k in keys] + [now] for r in rels])
 

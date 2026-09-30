@@ -158,6 +158,12 @@ def relate(min_overlap: float = typer.Option(0.5, help="Minimum share of FK valu
     rels = relationships.discover(con, min_overlap=min_overlap, name_threshold=name_threshold, deep=deep,
                                   max_pairs=max_pairs, echo=typer.echo, schemas=sc)
     relationships.save(con, rels, schemas=sc)
+    if not rels:
+        scope = f" in {', '.join(sorted(sc))}" if sc else ""
+        typer.secho(f"No relationships found{scope} ({time.time() - t0:.1f}s) — nothing to relate. "
+                    "Try --deep, a lower --min-overlap, or add another schema with -s to look for cross-system links.", fg="yellow")
+        con.close()
+        return
     for r in sorted(rels, key=lambda r: -r["confidence"])[:40]:
         card = r.get("cardinality") or ""
         extra = ""

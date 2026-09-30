@@ -379,7 +379,8 @@ def save(con, tprof: dict, cols: list[dict]):
             if k in d:
                 d[k] = json.dumps(d[k], default=str) if d[k] is not None else None
         rows.append([d.get(k) for k in names])
-    con.executemany(f"INSERT INTO {META}.column_profile ({', '.join(names)}) VALUES ({', '.join('?' * len(names))})", rows)
+    if rows:
+        con.executemany(f"INSERT INTO {META}.column_profile ({', '.join(names)}) VALUES ({', '.join('?' * len(names))})", rows)
 
 
 def load_profile(con, schema: str, table: str):
